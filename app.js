@@ -425,6 +425,339 @@ function loteOptions(selected, apenasAtivos = true) {
 }
 
 // ------------------------------------------------------------
+// IMPORTAÇÃO DE CSV (genérico, com mapeamento de colunas)
+// Funciona com qualquer exportação (leitor de microchip, planilha
+// de pastos etc.) — o usuário indica qual coluna é qual.
+// ------------------------------------------------------------
+function parseCSV(text) {
+  // remove BOM se existir
+  if (text.charCodeAt(0) === 0xFEFF) text = text.slice(1);
+  const primeiraLinha = text.split(/\r?\n/)[0] || '';
+  const delim = (primeiraLinha.split(';').length > primeiraLinha.split(',').length) ? ';' : ',';
+  const rows = [];
+  let row = [], field = '', inQuotes = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (inQuotes) {
+      if (c === '"') {
+        if (text[i + 1] === '"') { field += '"'; i++; } else { inQuotes = false; }
+      } else field += c;
+    } else if (c === '"') {
+      inQuotes = true;
+    } else if (c === delim) {
+      row.push(field); field = '';
+    } else if (c === '\n') {
+      row.push(field); rows.push(row); row = []; field = '';
+    } else if (c === '\r') {
+      // ignora
+    } else {
+      field += c;
+    }
+  }
+  if (field.length || row.length) { row.push(field); rows.push(row); }
+  return rows.filter(r => r.some(v => (v || '').trim() !== ''));
+}
+
+function normalizarSexo(v) {
+  const s = (v || '').trim().toLowerCase();
+  if (['f', 'femea', 'fêmea', 'female', 'fem'].includes(s)) return 'F';
+  if (['m', 'macho', 'male'].includes(s)) return 'M';
+  return s.startsWith('f') ? 'F' : 'M';
+}
+
+function parseDataFlexivel(v) {
+  if (!v) return null;
+  v = String(v).trim();
+  let m = v.match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (m) return `${m[1]}-${m[2]}-${m[3]}`;
+  m = v.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})/);
+  if (m) return `${m[3]}-${String(m[2]).padStart(2, '0')}-${String(m[1]).padStart(2, '0')}`;
+  return null;
+}
+
+// Modal genérico: seleciona arquivo CSV, mostra mapeamento de colunas → campos, e chama onImportar(linhas, mapeamento, valoresFixos)
+function formImportarCSV({ titulo, instrucoes, campos, onImportar }) {
+  showModal(titulo, `
+    <p class="text-sm text-gray-600 mb-3">${instrucoes || 'Selecione um arquivo .csv exportado do seu aplicativo ou planilha.'}</p>
+    <input type="file" id="csvFile" accept=".csv,text/csv" class="mb-3 block text-sm">
+    <div id="csvArea" class="text-sm text-gray-400">Nenhum arquivo selecionado ainda.</div>
+  `, 'max-w-3xl');
+
+  document.getElementById('csvFile').addEventListener('change', async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    const text = await file.text();
+    const rows = parseCSV(text);
+    if (!rows.length) {
+      document.getElementById('csvArea').innerHTML = '<p class="text-red-600">Não foi possível ler nenhuma linha desse arquivo.</p>';
+      return;
+    }
+    const headers = rows[0].map(h => (h || '').trim());
+    const dataRows = rows.slice(1);
+    renderMapeamento(headers, dataRows);
+  });
+
+  function renderMapeamento(headers, dataRows) {
+    document.getElementById('csvArea').innerHTML = `
+      <p class="text-sm mb-2"><strong>${dataRows.length}</strong> linha(s) de dados encontrada(s). Indique qual coluna do seu arquivo corresponde a cada campo:</p>
+      <div class="grid md:grid-cols-2 gap-x-4 gap-y-2 mb-3">
+        ${campos.map(c => `
+          <label class="block text-sm">
+            <span class="text-gray-600">${c.label}${c.obrigatorio ? ' *' : ''}</span>
+            <select data-campo="${c.key}" class="mapSelect mt-1 w-full border rounded-md px-2 py-1.5 text-sm bg-white">
+              <option value="">— não importar —</option>
+              ${headers.map((h, i) => `<option value="${i}">${escapeHtml(h || 'Coluna ' + (i + 1))}</option>`).join('')}
+              ${c.permiteFixo ? `<option value="__fixo__">Usar o mesmo valor para todos...</option>` : ''}
+            </select>
+            ${c.permiteFixo ? `<input type="text" data-fixo="${c.key}" placeholder="valor fixo" class="hidden mt-1 w-full border rounded-md px-2 py-1 text-xs">` : ''}
+          </label>
+        `).join('')}
+      </div>
+      <p class="text-xs text-gray-400 mb-1">Prévia das 3 primeiras linhas:</p>
+      <div class="overflow-x-auto border rounded-md mb-3">
+        <table class="w-full text-xs">
+          <thead><tr>${headers.map(h => `<th class="text-left px-2 py-1 border-b bg-gray-50">${escapeHtml(h)}</th>`).join('')}</tr></thead>
+          <tbody>${dataRows.slice(0, 3).map(r => `<tr>${r.map(v => `<td class="px-2 py-1 border-b">${escapeHtml(v)}</td>`).join('')}</tr>`).join('')}</tbody>
+        </table>
+      </div>
+      <div class="flex justify-end gap-2">
+        <button type="button" id="btnCancelarImp" class="px-4 py-2 text-sm rounded-md border">Cancelar</button>
+        <button type="button" id="btnConfirmarImp" class="px-4 py-2 text-sm rounded-md bg-brand-600 hover:bg-brand-700 text-white">Importar ${dataRows.length} registro(s)</button>
+      </div>
+    `;
+    document.getElementById('btnCancelarImp').onclick = closeModal;
+    document.querySelectorAll('.mapSelect').forEach(selEl => {
+      selEl.addEventListener('change', () => {
+        const campo = selEl.dataset.campo;
+        const fixoInput = document.querySelector(`[data-fixo="${campo}"]`);
+        if (fixoInput) fixoInput.classList.toggle('hidden', selEl.value !== '__fixo__');
+      });
+    });
+    document.getElementById('btnConfirmarImp').onclick = async () => {
+      const mapping = {};
+      const fixos = {};
+      document.querySelectorAll('.mapSelect').forEach(selEl => {
+        const campo = selEl.dataset.campo;
+        if (selEl.value === '__fixo__') {
+          fixos[campo] = document.querySelector(`[data-fixo="${campo}"]`)?.value || '';
+        } else if (selEl.value !== '') {
+          mapping[campo] = parseInt(selEl.value, 10);
+        }
+      });
+      const faltando = campos.filter(c => c.obrigatorio && mapping[c.key] === undefined && !fixos[c.key]);
+      if (faltando.length) {
+        toast('Preencha o mapeamento obrigatório: ' + faltando.map(f => f.label).join(', '), 'error');
+        return;
+      }
+      const btn = document.getElementById('btnConfirmarImp');
+      btn.disabled = true; btn.textContent = 'Importando...';
+      try {
+        await onImportar(dataRows, mapping, fixos);
+      } finally {
+        btn.disabled = false;
+      }
+    };
+  }
+}
+
+async function inserirEmLotes(table, registros, tamanhoLote = 200) {
+  let sucesso = 0, falhas = 0;
+  for (let i = 0; i < registros.length; i += tamanhoLote) {
+    const bloco = registros.slice(i, i + tamanhoLote);
+    const { error } = await sb.from(table).insert(bloco);
+    if (error) { console.error(error); falhas += bloco.length; } else { sucesso += bloco.length; }
+  }
+  return { sucesso, falhas };
+}
+
+function importarAnimaisCSV() {
+  formImportarCSV({
+    titulo: 'Importar animais de CSV (leitor de microchip / planilha)',
+    instrucoes: 'Funciona com a exportação de qualquer aplicativo de leitura de brinco eletrônico — basta indicar abaixo qual coluna do seu arquivo é cada campo.',
+    campos: [
+      { key: 'identificacao', label: 'Brinco / identificação (eletrônico ou visual)', obrigatorio: true },
+      { key: 'nome', label: 'Nome' },
+      { key: 'sexo', label: 'Sexo', obrigatorio: true, permiteFixo: true },
+      { key: 'categoria', label: 'Categoria', obrigatorio: true, permiteFixo: true },
+      { key: 'raca', label: 'Raça' },
+      { key: 'data_nascimento', label: 'Data de nascimento' },
+      { key: 'peso_atual', label: 'Peso (kg)' },
+      { key: 'lote', label: 'Lote (pelo nome, opcional)' },
+    ],
+    onImportar: async (rows, mapping, fixos) => {
+      const get = (r, k) => (mapping[k] !== undefined ? (r[mapping[k]] || '').trim() : (fixos[k] || ''));
+      const registros = rows.map(r => {
+        const loteNome = get(r, 'lote');
+        const lote = loteNome ? lotesCache.find(l => l.nome.toLowerCase() === loteNome.toLowerCase()) : null;
+        const peso = get(r, 'peso_atual');
+        return {
+          identificacao: get(r, 'identificacao'),
+          nome: get(r, 'nome') || null,
+          sexo: normalizarSexo(get(r, 'sexo')),
+          categoria: get(r, 'categoria') || 'Bezerra',
+          raca: get(r, 'raca') || null,
+          data_nascimento: parseDataFlexivel(get(r, 'data_nascimento')),
+          peso_atual: peso ? Number(String(peso).replace(',', '.')) || null : null,
+          peso_atual_data: peso ? todayISO() : null,
+          lote_id: lote ? lote.id : null,
+          status: 'ativo',
+        };
+      }).filter(r => r.identificacao);
+
+      if (!registros.length) {
+        toast('Nenhum registro válido (confira a coluna de identificação)', 'error');
+        return;
+      }
+      const { sucesso, falhas } = await inserirEmLotes('animais', registros);
+      toast(`Importação concluída: ${sucesso} animal(is) importado(s)${falhas ? `, ${falhas} com erro` : ''}`, falhas ? 'error' : 'success');
+      closeModal();
+      pageAnimais();
+    },
+  });
+}
+
+function importarPastosCSV() {
+  formImportarCSV({
+    titulo: 'Importar pastos de CSV',
+    instrucoes: 'Arquivo simples com o nome do pasto e a área em hectares (ex.: "nome do pasto,area").',
+    campos: [
+      { key: 'nome', label: 'Nome do pasto', obrigatorio: true },
+      { key: 'area_ha', label: 'Área (ha)' },
+    ],
+    onImportar: async (rows, mapping, fixos) => {
+      const get = (r, k) => (mapping[k] !== undefined ? (r[mapping[k]] || '').trim() : (fixos[k] || ''));
+      const registros = rows.map(r => {
+        const area = get(r, 'area_ha');
+        return {
+          nome: get(r, 'nome'),
+          area_ha: area ? Number(String(area).replace(',', '.')) || null : null,
+          ativo: true,
+        };
+      }).filter(r => r.nome);
+
+      if (!registros.length) {
+        toast('Nenhum registro válido (confira a coluna de nome do pasto)', 'error');
+        return;
+      }
+      const { sucesso, falhas } = await inserirEmLotes('pastos', registros);
+      toast(`Importação concluída: ${sucesso} pasto(s) importado(s)${falhas ? `, ${falhas} com erro` : ''}`, falhas ? 'error' : 'success');
+      closeModal();
+      await refreshCaches();
+      pagePastos();
+    },
+  });
+}
+
+// ------------------------------------------------------------
+// IMPORTAÇÃO DE NOTA FISCAL (XML) e ANEXOS (fotos de nota, PDFs)
+// ------------------------------------------------------------
+function xmlTag(root, name) {
+  const els = root.getElementsByTagName(name);
+  return els.length ? (els[0].textContent || '').trim() : '';
+}
+
+function parseNFeXML(xmlText) {
+  try {
+    const xml = new DOMParser().parseFromString(xmlText, 'application/xml');
+    if (xml.getElementsByTagName('parsererror').length) return null;
+    const infNFeAttrId = xml.getElementsByTagName('infNFe')[0]?.getAttribute('Id') || '';
+    const chave = xmlTag(xml, 'chNFe') || infNFeAttrId.replace(/^NFe/, '');
+    const numero = xmlTag(xml, 'nNF');
+    let data = xmlTag(xml, 'dhEmi') || xmlTag(xml, 'dEmi');
+    data = data ? data.slice(0, 10) : todayISO();
+    const fornecedor = xmlTag(xml, 'xNome');
+    const valorTxt = xmlTag(xml, 'vNF');
+    if (!numero && !valorTxt && !fornecedor) return null;
+    return { chave, numero, data, fornecedor, valor: valorTxt ? Number(valorTxt) : null };
+  } catch (e) {
+    return null;
+  }
+}
+
+function formImportarNotaFiscal() {
+  showModal('Importar nota fiscal (XML)', `
+    <p class="text-sm text-gray-600 mb-3">Selecione um ou mais arquivos .xml de NF-e/NFC-e (o mesmo arquivo que o fornecedor envia, ou que você baixa da SEFAZ). Os dados são lidos automaticamente e viram lançamentos de custo.</p>
+    <input type="file" id="xmlFile" accept=".xml,text/xml" multiple class="mb-3 block text-sm">
+    <div id="xmlArea" class="text-sm text-gray-400">Nenhum arquivo selecionado ainda.</div>
+  `, 'max-w-2xl');
+
+  document.getElementById('xmlFile').addEventListener('change', async (e) => {
+    const files = Array.from(e.target.files);
+    const parsed = [];
+    for (const f of files) {
+      const text = await f.text();
+      const info = parseNFeXML(text);
+      if (info) parsed.push(info); else toast('Não foi possível ler o XML: ' + f.name, 'error');
+    }
+    if (!parsed.length) {
+      document.getElementById('xmlArea').innerHTML = '<p class="text-red-600">Nenhuma nota fiscal válida encontrada nos arquivos selecionados.</p>';
+      return;
+    }
+    renderNFPreview(parsed);
+  });
+
+  function renderNFPreview(parsed) {
+    document.getElementById('xmlArea').innerHTML = `
+      <p class="text-sm mb-2">${parsed.length} nota(s) lida(s). Confira e ajuste antes de lançar como custo:</p>
+      <div class="space-y-3 max-h-80 overflow-y-auto">
+        ${parsed.map((nf, i) => `
+          <div class="border rounded-md p-3">
+            <div class="grid grid-cols-2 gap-2">
+              ${fld('Fornecedor', inp(`forn_${i}`, nf.fornecedor, 'text', `id="forn_${i}"`))}
+              ${fld('Valor (R$)', inp(`valor_${i}`, nf.valor, 'number', `step="0.01" id="valor_${i}"`))}
+              ${fld('Data', inp(`data_${i}`, nf.data, 'date', `id="data_${i}"`))}
+              ${fld('Categoria', sel(`cat_${i}`, CATEGORIAS_CUSTO, 'outros', `id="cat_${i}"`))}
+            </div>
+            <p class="text-xs text-gray-400 mt-1">NF nº ${escapeHtml(nf.numero || '-')} ${nf.chave ? '· chave ' + escapeHtml(nf.chave.slice(-8)) : ''}</p>
+          </div>
+        `).join('')}
+      </div>
+      <div class="flex justify-end gap-2 mt-3">
+        <button type="button" id="btnCancelarNF" class="px-4 py-2 text-sm rounded-md border">Cancelar</button>
+        <button type="button" id="btnConfirmarNF" class="px-4 py-2 text-sm rounded-md bg-brand-600 hover:bg-brand-700 text-white">Lançar ${parsed.length} custo(s)</button>
+      </div>
+    `;
+    document.getElementById('btnCancelarNF').onclick = closeModal;
+    document.getElementById('btnConfirmarNF').onclick = async () => {
+      const registros = parsed.map((nf, i) => ({
+        categoria: document.getElementById(`cat_${i}`).value,
+        descricao: 'NF ' + (nf.numero || '') + (document.getElementById(`forn_${i}`).value ? ' - ' + document.getElementById(`forn_${i}`).value : ''),
+        valor: Number(document.getElementById(`valor_${i}`).value) || 0,
+        data: document.getElementById(`data_${i}`).value || todayISO(),
+        nf_numero: nf.numero || null,
+        nf_fornecedor: document.getElementById(`forn_${i}`).value || null,
+        nf_chave_acesso: nf.chave || null,
+      })).filter(r => r.valor > 0);
+      if (!registros.length) {
+        toast('Nenhum lançamento com valor válido para importar', 'error');
+        return;
+      }
+      const { sucesso, falhas } = await inserirEmLotes('custos', registros);
+      toast(`${sucesso} custo(s) lançado(s) a partir das notas fiscais${falhas ? `, ${falhas} com erro` : ''}`, falhas ? 'error' : 'success');
+      closeModal();
+      pageCustos();
+    };
+  }
+}
+
+// upload de foto/PDF (ex.: nota fiscal fotografada) para o Supabase Storage
+async function uploadAnexo(file, pastaPrefix = 'custos') {
+  const ext = (file.name.split('.').pop() || 'jpg').toLowerCase().replace(/[^a-z0-9]/g, '') || 'jpg';
+  const path = `${pastaPrefix}/${Date.now()}_${Math.random().toString(36).slice(2, 8)}.${ext}`;
+  const { error } = await sb.storage.from('anexos').upload(path, file);
+  if (error) {
+    toast('Erro ao enviar anexo: ' + error.message, 'error');
+    throw error;
+  }
+  return path;
+}
+function anexoUrl(path) {
+  if (!path) return null;
+  const { data } = sb.storage.from('anexos').getPublicUrl(path);
+  return data?.publicUrl || null;
+}
+
+// ------------------------------------------------------------
 // LÓGICA DE REPRODUÇÃO (gestações em andamento / previsão de partos)
 // ------------------------------------------------------------
 // A partir da lista de eventos reprodutivos de TODOS os animais, calcula,
@@ -589,7 +922,10 @@ async function pageAnimais() {
   content.innerHTML = `
     <div class="flex flex-wrap justify-between items-center gap-2 mb-4">
       <h1 class="text-xl font-bold">Rebanho</h1>
-      <button id="btnNovoAnimal" class="bg-brand-600 hover:bg-brand-700 text-white text-sm font-medium px-4 py-2 rounded-md">+ Novo animal</button>
+      <div class="flex gap-2">
+        <button id="btnImportarAnimais" class="bg-white border text-sm font-medium px-4 py-2 rounded-md hover:bg-gray-50">📥 Importar CSV</button>
+        <button id="btnNovoAnimal" class="bg-brand-600 hover:bg-brand-700 text-white text-sm font-medium px-4 py-2 rounded-md">+ Novo animal</button>
+      </div>
     </div>
 
     <div class="bg-white border rounded-lg p-3 mb-4 flex flex-wrap gap-3 items-end">
@@ -638,6 +974,7 @@ async function pageAnimais() {
   `;
 
   document.getElementById('btnNovoAnimal').onclick = () => formAnimal();
+  document.getElementById('btnImportarAnimais').onclick = () => importarAnimaisCSV();
   document.getElementById('btnFiltrar').onclick = () => {
     animaisFiltro.busca = document.getElementById('fBusca').value;
     animaisFiltro.status = document.getElementById('fStatus').value;
@@ -870,7 +1207,10 @@ async function pagePastos() {
   content.innerHTML = `
     <div class="flex flex-wrap justify-between items-center gap-2 mb-4">
       <h1 class="text-xl font-bold">Pastos</h1>
-      <button id="btnNovoPasto" class="bg-brand-600 hover:bg-brand-700 text-white text-sm font-medium px-4 py-2 rounded-md">+ Novo pasto</button>
+      <div class="flex gap-2">
+        <button id="btnImportarPastos" class="bg-white border text-sm font-medium px-4 py-2 rounded-md hover:bg-gray-50">📥 Importar CSV</button>
+        <button id="btnNovoPasto" class="bg-brand-600 hover:bg-brand-700 text-white text-sm font-medium px-4 py-2 rounded-md">+ Novo pasto</button>
+      </div>
     </div>
     <div class="grid md:grid-cols-2 lg:grid-cols-3 gap-4">
       ${pastosCache.map(p => {
@@ -891,6 +1231,7 @@ async function pagePastos() {
     </div>
   `;
   document.getElementById('btnNovoPasto').onclick = () => formPasto();
+  document.getElementById('btnImportarPastos').onclick = () => importarPastosCSV();
   document.querySelectorAll('.btnEditarPasto').forEach(b => {
     b.onclick = () => formPasto(pastosCache.find(x => x.id === b.dataset.id));
   });
@@ -1553,7 +1894,10 @@ async function pageCustos() {
   content.innerHTML = `
     <div class="flex flex-wrap justify-between items-center gap-2 mb-4">
       <h1 class="text-xl font-bold">Custos</h1>
-      <button id="btnNovoCusto" class="bg-brand-600 hover:bg-brand-700 text-white text-sm font-medium px-4 py-2 rounded-md">+ Novo lançamento</button>
+      <div class="flex gap-2">
+        <button id="btnImportarNF" class="bg-white border text-sm font-medium px-4 py-2 rounded-md hover:bg-gray-50">📄 Importar nota fiscal (XML)</button>
+        <button id="btnNovoCusto" class="bg-brand-600 hover:bg-brand-700 text-white text-sm font-medium px-4 py-2 rounded-md">+ Novo lançamento</button>
+      </div>
     </div>
 
     <div class="bg-white border rounded-lg p-3 mb-4 flex flex-wrap gap-3 items-end">
@@ -1570,20 +1914,22 @@ async function pageCustos() {
 
     <div class="bg-white border rounded-lg overflow-x-auto">
       <table class="w-full text-sm">
-        <thead><tr class="text-left text-gray-500 border-b"><th class="py-2 px-3">Data</th><th>Categoria</th><th>Descrição</th><th>Lote/Pasto</th><th class="text-right">Valor</th><th></th></tr></thead>
+        <thead><tr class="text-left text-gray-500 border-b"><th class="py-2 px-3">Data</th><th>Categoria</th><th>Descrição</th><th>Lote/Pasto</th><th class="text-right">Valor</th><th></th><th></th></tr></thead>
         <tbody>${custos.map(c => `<tr class="border-b last:border-0">
           <td class="py-2 px-3">${fmtDate(c.data)}</td>
           <td>${CATEGORIAS_CUSTO.find(x => x.value === c.categoria)?.label || c.categoria}</td>
-          <td>${escapeHtml(c.descricao)}</td>
+          <td>${escapeHtml(c.descricao)}${c.nf_numero ? ` <span class="text-xs text-gray-400">(NF ${escapeHtml(c.nf_numero)})</span>` : ''}</td>
           <td>${c.lote ? escapeHtml(c.lote.nome) : (c.pasto ? escapeHtml(c.pasto.nome) : '-')}</td>
           <td class="text-right">${fmtMoney(c.valor)}</td>
+          <td class="text-center px-1">${c.anexo_path ? `<a href="${anexoUrl(c.anexo_path)}" target="_blank" rel="noopener" title="Ver anexo">📎</a>` : ''}</td>
           <td class="text-right px-3"><button data-id="${c.id}" class="btnExcluirCusto text-gray-400 hover:text-red-600">🗑️</button></td>
-        </tr>`).join('') || `<tr><td colspan="6" class="text-center text-gray-400 py-6">Nenhum custo lançado no período</td></tr>`}</tbody>
+        </tr>`).join('') || `<tr><td colspan="7" class="text-center text-gray-400 py-6">Nenhum custo lançado no período</td></tr>`}</tbody>
       </table>
     </div>
   `;
 
   document.getElementById('btnNovoCusto').onclick = () => formCusto();
+  document.getElementById('btnImportarNF').onclick = () => formImportarNotaFiscal();
   document.getElementById('btnFiltrarCusto').onclick = () => {
     custosFiltro.de = document.getElementById('cDe').value;
     custosFiltro.ate = document.getElementById('cAte').value;
@@ -1610,9 +1956,11 @@ function formCusto() {
       ${fld('Lote (opcional)', sel('lote_id', [], '').replace('<select', '<select id="selLoteCusto"'))}
       ${fld('Pasto (opcional)', sel('pasto_id', [], '').replace('<select', '<select id="selPastoCusto"'))}
       ${fld('Observações', txt('observacoes'))}
+      ${fld('Anexar foto ou PDF da nota (opcional)', '<input type="file" name="anexo_file" accept="image/*,.pdf" capture="environment" class="mt-1 w-full text-sm">', '')}
+      <p class="text-xs text-gray-400 -mt-2 mb-2">Dica: se você recebeu a nota fotografada pelo WhatsApp, salve a foto na galeria do celular e selecione ela aqui.</p>
       <div class="flex justify-end gap-2 mt-2">
         <button type="button" id="btnCancelar" class="px-4 py-2 text-sm rounded-md border">Cancelar</button>
-        <button type="submit" class="px-4 py-2 text-sm rounded-md bg-brand-600 hover:bg-brand-700 text-white">Salvar</button>
+        <button type="submit" id="btnSalvarCusto" class="px-4 py-2 text-sm rounded-md bg-brand-600 hover:bg-brand-700 text-white">Salvar</button>
       </div>
     </form>
   `);
@@ -1621,14 +1969,27 @@ function formCusto() {
   document.getElementById('btnCancelar').onclick = closeModal;
   document.getElementById('formCusto').addEventListener('submit', async (e) => {
     e.preventDefault();
-    const obj = formToObject(e.target);
+    const form = e.target;
+    const fileInput = form.querySelector('[name=anexo_file]');
+    const arquivo = fileInput?.files?.[0] || null;
+    const obj = formToObject(form);
+    delete obj.anexo_file;
     obj.valor = Number(obj.valor);
+    const btn = document.getElementById('btnSalvarCusto');
+    btn.disabled = true;
     try {
+      if (arquivo) {
+        btn.textContent = 'Enviando anexo...';
+        obj.anexo_path = await uploadAnexo(arquivo);
+      }
       await dbInsert('custos', obj);
       toast('Custo lançado', 'success');
       closeModal();
       pageCustos();
-    } catch (err) {}
+    } catch (err) {
+      btn.disabled = false;
+      btn.textContent = 'Salvar';
+    }
   });
 }
 
