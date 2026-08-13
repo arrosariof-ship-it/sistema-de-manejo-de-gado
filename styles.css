@@ -1,0 +1,5 @@
+/* pequenos ajustes visuais além do Tailwind (via CDN) */
+body { -webkit-tap-highlight-color: transparent; }
+table { border-collapse: collapse; }
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-thumb { background: #c2ddb6; border-radius: 4px; }
