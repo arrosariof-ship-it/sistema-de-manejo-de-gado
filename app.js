@@ -143,6 +143,7 @@ const NAV_ITEMS = [
   { route: 'alimentacao', label: 'Alimentação', icon: '🌾' },
   { route: 'sanidade', label: 'Sanidade', icon: '💉' },
   { route: 'custos', label: 'Custos', icon: '💰' },
+  { route: 'orcamentos', label: 'Orçamentos', icon: '📐' },
   { route: 'relatorios', label: 'Relatórios', icon: '📑' },
 ];
 
@@ -213,6 +214,7 @@ const ROUTES = {
   alimentacao: pageAlimentacao,
   sanidade: pageSanidade,
   custos: pageCustos,
+  orcamentos: pageOrcamentos,
   relatorios: pageRelatorios,
 };
 
@@ -412,6 +414,14 @@ async function dbCount(table, filters = []) {
   if (error) { console.error(error); return 0; }
   return count || 0;
 }
+async function dbUpsert(table, obj, onConflict) {
+  const { data, error } = await sb.from(table).upsert(obj, { onConflict }).select();
+  if (error) {
+    toast('Erro ao salvar: ' + error.message, 'error');
+    throw error;
+  }
+  return data;
+}
 
 // pequenos helpers de opções reutilizados nos formulários
 function pastoOptions(selected) {
@@ -478,24 +488,69 @@ function parseDataFlexivel(v) {
 // Modal genérico: seleciona arquivo CSV, mostra mapeamento de colunas → campos, e chama onImportar(linhas, mapeamento, valoresFixos)
 function formImportarCSV({ titulo, instrucoes, campos, onImportar }) {
   showModal(titulo, `
-    <p class="text-sm text-gray-600 mb-3">${instrucoes || 'Selecione um arquivo .csv exportado do seu aplicativo ou planilha.'}</p>
-    <input type="file" id="csvFile" accept=".csv,text/csv" class="mb-3 block text-sm">
+    <p class="text-sm text-gray-600 mb-3">${instrucoes || 'Selecione um arquivo .csv, .xlsx ou .xls exportado do seu aplicativo ou planilha.'}</p>
+    <input type="file" id="csvFile" accept=".csv,.xlsx,.xls,text/csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel" class="mb-3 block text-sm">
     <div id="csvArea" class="text-sm text-gray-400">Nenhum arquivo selecionado ainda.</div>
   `, 'max-w-3xl');
 
   document.getElementById('csvFile').addEventListener('change', async (e) => {
     const file = e.target.files[0];
     if (!file) return;
-    const text = await file.text();
-    const rows = parseCSV(text);
-    if (!rows.length) {
+    document.getElementById('csvArea').innerHTML = '<p class="text-gray-400">Lendo arquivo...</p>';
+    try {
+      if (/\.(xlsx|xls)$/i.test(file.name)) {
+        if (typeof XLSX === 'undefined') {
+          document.getElementById('csvArea').innerHTML = '<p class="text-red-600">Não foi possível carregar o leitor de planilhas Excel (verifique sua conexão com a internet) — tente novamente, ou exporte o arquivo como .csv.</p>';
+          return;
+        }
+        const buf = await file.arrayBuffer();
+        const wb = XLSX.read(buf, { type: 'array', cellDates: true });
+        if (wb.SheetNames.length > 1) renderSelecaoAba(wb);
+        else processarPlanilha(wb, wb.SheetNames[0]);
+      } else {
+        const text = await file.text();
+        prosseguirComLinhas(parseCSV(text));
+      }
+    } catch (err) {
+      console.error(err);
+      document.getElementById('csvArea').innerHTML = '<p class="text-red-600">Não foi possível ler esse arquivo. Confira se é um .csv, .xlsx ou .xls válido.</p>';
+    }
+  });
+
+  function renderSelecaoAba(wb) {
+    document.getElementById('csvArea').innerHTML = `
+      <label class="block text-sm mb-3"><span class="text-gray-600">Sua planilha tem várias abas — qual delas usar?</span>
+        <select id="selAba" class="mt-1 w-full border rounded-md px-2 py-1.5 text-sm bg-white">
+          ${wb.SheetNames.map(n => `<option value="${escapeHtml(n)}">${escapeHtml(n)}</option>`).join('')}
+        </select>
+      </label>
+      <button type="button" id="btnUsarAba" class="px-4 py-2 text-sm rounded-md bg-brand-600 hover:bg-brand-700 text-white">Usar esta aba</button>
+    `;
+    document.getElementById('btnUsarAba').onclick = () => processarPlanilha(wb, document.getElementById('selAba').value);
+  }
+
+  function processarPlanilha(wb, sheetName) {
+    const ws = wb.Sheets[sheetName];
+    const rows = XLSX.utils.sheet_to_json(ws, { header: 1, raw: true, defval: '' }).map(r =>
+      r.map(v => {
+        if (v instanceof Date) return v.toISOString().slice(0, 10);
+        if (v === null || v === undefined) return '';
+        return String(v);
+      })
+    );
+    prosseguirComLinhas(rows);
+  }
+
+  function prosseguirComLinhas(rows) {
+    const limpas = (rows || []).filter(r => r.some(v => (v || '').toString().trim() !== ''));
+    if (!limpas.length) {
       document.getElementById('csvArea').innerHTML = '<p class="text-red-600">Não foi possível ler nenhuma linha desse arquivo.</p>';
       return;
     }
-    const headers = rows[0].map(h => (h || '').trim());
-    const dataRows = rows.slice(1);
+    const headers = limpas[0].map(h => (h || '').toString().trim());
+    const dataRows = limpas.slice(1);
     renderMapeamento(headers, dataRows);
-  });
+  }
 
   function renderMapeamento(headers, dataRows) {
     document.getElementById('csvArea').innerHTML = `
@@ -644,6 +699,87 @@ function importarPastosCSV() {
       closeModal();
       await refreshCaches();
       pagePastos();
+    },
+  });
+}
+
+// aceita "1.234,56", "R$ 1.234,56", "1234.56" etc.
+function parseValorFlexivel(v) {
+  if (v === null || v === undefined || v === '') return NaN;
+  let s = String(v).trim().replace(/^R\$\s?/i, '').replace(/\s/g, '');
+  if (/,\d{1,2}$/.test(s)) {
+    s = s.replace(/\./g, '').replace(',', '.'); // formato brasileiro: 1.234,56
+  } else {
+    s = s.replace(/,/g, ''); // formato americano com vírgula de milhar: 1,234.56
+  }
+  return parseFloat(s);
+}
+
+// tenta reconhecer a categoria pelo texto da planilha (ex.: "Ração", "Veterinário", "Salários"...)
+function normalizarCategoria(v) {
+  const s = (v || '').trim().toLowerCase();
+  if (!s) return null;
+  if (CATEGORIAS_CUSTO.some(c => c.value === s)) return s;
+  const mapa = [
+    [['aliment', 'ração', 'racao', 'nutri', 'suplement', 'sal mineral'], 'alimentacao'],
+    [['sanidade', 'veterinar', 'vacina', 'remedio', 'remédio', 'medicamento', 'saude', 'saúde'], 'sanidade'],
+    [['mao de obra', 'mão de obra', 'salario', 'salário', 'funcionario', 'funcionário', 'diarista', 'folha'], 'mao_de_obra'],
+    [['infraestrutura', 'cerca', 'curral', 'manutenc', 'construc'], 'infraestrutura'],
+    [['reprodu', 'iatf', 'semen', 'sêmen', 'inseminac'], 'reproducao'],
+    [['combustivel', 'combustível', 'diesel', 'gasolina', 'oleo diesel', 'óleo diesel', 'abastec'], 'combustivel'],
+    [['assinatura', 'mensalidade', 'software', 'sistema', 'streaming'], 'assinaturas'],
+    [['investimento', 'maquinario', 'maquinário', 'implemento', 'trator novo', 'benfeitoria'], 'investimentos'],
+    [['imposto', 'taxa', 'itr', 'funrural'], 'impostos_taxas'],
+  ];
+  for (const [chaves, cat] of mapa) {
+    if (chaves.some(k => s.includes(k))) return cat;
+  }
+  return null;
+}
+
+function importarLancamentosCSV() {
+  formImportarCSV({
+    titulo: 'Importar lançamentos de custos (planilha Excel/CSV)',
+    instrucoes: 'Selecione a planilha de lançamentos que você já utiliza (.xlsx, .xls ou .csv). Indique abaixo qual coluna é a descrição, o valor, a data etc.',
+    campos: [
+      { key: 'descricao', label: 'Descrição do lançamento', obrigatorio: true },
+      { key: 'valor', label: 'Valor (R$)', obrigatorio: true },
+      { key: 'data', label: 'Data', obrigatorio: true, permiteFixo: true },
+      { key: 'categoria', label: 'Categoria', permiteFixo: true },
+      { key: 'lote', label: 'Lote (pelo nome, opcional)' },
+      { key: 'pasto', label: 'Pasto (pelo nome, opcional)' },
+      { key: 'observacoes', label: 'Observações' },
+    ],
+    onImportar: async (rows, mapping, fixos) => {
+      const get = (r, k) => (mapping[k] !== undefined ? (r[mapping[k]] || '').trim() : (fixos[k] || ''));
+      let semValor = 0;
+      const registros = rows.map(r => {
+        const valor = parseValorFlexivel(get(r, 'valor'));
+        const loteNome = get(r, 'lote');
+        const pastoNome = get(r, 'pasto');
+        const lote = loteNome ? lotesCache.find(l => l.nome.toLowerCase() === loteNome.toLowerCase()) : null;
+        const pasto = pastoNome ? pastosCache.find(p => p.nome.toLowerCase() === pastoNome.toLowerCase()) : null;
+        if (!get(r, 'descricao') || isNaN(valor) || valor <= 0) { semValor++; return null; }
+        return {
+          descricao: get(r, 'descricao'),
+          valor,
+          data: parseDataFlexivel(get(r, 'data')) || todayISO(),
+          categoria: normalizarCategoria(get(r, 'categoria')) || 'outros',
+          lote_id: lote ? lote.id : null,
+          pasto_id: pasto ? pasto.id : null,
+          observacoes: get(r, 'observacoes') || null,
+        };
+      }).filter(Boolean);
+
+      if (!registros.length) {
+        toast('Nenhum lançamento válido (confira as colunas de descrição e valor)', 'error');
+        return;
+      }
+      const { sucesso, falhas } = await inserirEmLotes('custos', registros);
+      const avisoIgnorados = semValor ? `, ${semValor} linha(s) ignorada(s) por falta de descrição/valor` : '';
+      toast(`Importação concluída: ${sucesso} lançamento(s) importado(s)${falhas ? `, ${falhas} com erro` : ''}${avisoIgnorados}`, falhas ? 'error' : 'success');
+      closeModal();
+      pageCustos();
     },
   });
 }
@@ -1872,18 +2008,37 @@ async function formBaixa() {
 const CATEGORIAS_CUSTO = [
   { value: 'alimentacao', label: 'Alimentação' },
   { value: 'sanidade', label: 'Sanidade' },
-  { value: 'mao_de_obra', label: 'Mão de obra' },
+  { value: 'mao_de_obra', label: 'Mão de obra / Salários' },
   { value: 'infraestrutura', label: 'Infraestrutura' },
   { value: 'reproducao', label: 'Reprodução' },
+  { value: 'combustivel', label: 'Combustível' },
+  { value: 'assinaturas', label: 'Assinaturas' },
+  { value: 'investimentos', label: 'Investimentos' },
   { value: 'impostos_taxas', label: 'Impostos e taxas' },
   { value: 'outros', label: 'Outros' },
 ];
 let custosFiltro = { de: addDaysISO(todayISO(), -30), ate: todayISO(), categoria: '' };
+let custosTab = 'lancamentos';
 
 async function pageCustos() {
   const content = document.getElementById('page-content');
   content.innerHTML = loading();
   await refreshCaches();
+
+  content.innerHTML = `<h1 class="text-xl font-bold mb-4">Custos</h1><div id="custosTabs"></div><div id="custosContent"></div>`;
+  document.getElementById('custosTabs').innerHTML = tabsBar([
+    { key: 'lancamentos', label: 'Lançamentos' },
+    { key: 'combustivel', label: '⛽ Combustível' },
+  ], custosTab);
+  document.querySelectorAll('#custosTabs .tabBtn').forEach(b => { b.onclick = () => { custosTab = b.dataset.tab; pageCustos(); }; });
+
+  if (custosTab === 'combustivel') await renderCustosCombustivel();
+  else await renderCustosLancamentos();
+}
+
+async function renderCustosLancamentos() {
+  const content = document.getElementById('custosContent');
+  content.innerHTML = loading();
   const filters = [{ col: 'data', op: 'gte', val: custosFiltro.de }, { col: 'data', op: 'lte', val: custosFiltro.ate }];
   if (custosFiltro.categoria) filters.push({ col: 'categoria', val: custosFiltro.categoria });
   const custos = await dbSelect('custos', { select: '*, lote:lote_id(nome), pasto:pasto_id(nome)', filters, order: { col: 'data', asc: false } });
@@ -1892,9 +2047,9 @@ async function pageCustos() {
   custos.forEach(c => { porCategoria[c.categoria] = (porCategoria[c.categoria] || 0) + Number(c.valor || 0); });
 
   content.innerHTML = `
-    <div class="flex flex-wrap justify-between items-center gap-2 mb-4">
-      <h1 class="text-xl font-bold">Custos</h1>
-      <div class="flex gap-2">
+    <div class="flex flex-wrap justify-end items-center gap-2 mb-4">
+      <div class="flex flex-wrap gap-2">
+        <button id="btnImportarLancamentos" class="bg-white border text-sm font-medium px-4 py-2 rounded-md hover:bg-gray-50">📥 Importar planilha (Excel/CSV)</button>
         <button id="btnImportarNF" class="bg-white border text-sm font-medium px-4 py-2 rounded-md hover:bg-gray-50">📄 Importar nota fiscal (XML)</button>
         <button id="btnNovoCusto" class="bg-brand-600 hover:bg-brand-700 text-white text-sm font-medium px-4 py-2 rounded-md">+ Novo lançamento</button>
       </div>
@@ -1930,6 +2085,7 @@ async function pageCustos() {
 
   document.getElementById('btnNovoCusto').onclick = () => formCusto();
   document.getElementById('btnImportarNF').onclick = () => formImportarNotaFiscal();
+  document.getElementById('btnImportarLancamentos').onclick = () => importarLancamentosCSV();
   document.getElementById('btnFiltrarCusto').onclick = () => {
     custosFiltro.de = document.getElementById('cDe').value;
     custosFiltro.ate = document.getElementById('cAte').value;
@@ -1990,6 +2146,299 @@ function formCusto() {
       btn.disabled = false;
       btn.textContent = 'Salvar';
     }
+  });
+}
+
+// ------------------------------------------------------------
+// CUSTOS: CONTROLE DE COMBUSTÍVEL (horímetro do trator + bomba)
+// O equipamento sempre "dorme" abastecido, então a diferença de
+// horímetro/contador da bomba entre dois abastecimentos indica os
+// litros realmente consumidos — conferida com a quantidade informada.
+// ------------------------------------------------------------
+async function renderCustosCombustivel() {
+  const content = document.getElementById('custosContent');
+  content.innerHTML = loading();
+  const registros = await dbSelect('abastecimentos', { order: { col: 'data', asc: false }, limit: 200 });
+  const equipamentosConhecidos = [...new Set(registros.map(r => r.equipamento).filter(Boolean))];
+
+  const totalLitros = registros.reduce((s, r) => s + Number(r.litros_calculados || 0), 0);
+  const totalHoras = registros.reduce((s, r) => s + Number(r.horas_trabalhadas || 0), 0);
+  const consumoMedio = totalHoras ? (totalLitros / totalHoras) : 0;
+
+  content.innerHTML = `
+    <p class="text-sm text-gray-600 mb-4">Como o equipamento sempre "dorme" abastecido, a diferença entre o contador final e inicial da bomba mostra os litros realmente usados desde o último abastecimento — e você confere isso com a quantidade abastecida informada (leitura da bomba/nota).</p>
+    <div class="flex justify-end mb-3"><button id="btnNovoAbastecimento" class="bg-brand-600 hover:bg-brand-700 text-white text-sm font-medium px-4 py-2 rounded-md">+ Novo abastecimento</button></div>
+
+    <div class="grid grid-cols-2 md:grid-cols-4 gap-3 mb-6">
+      ${statCard('⛽', totalLitros.toFixed(0) + ' L', 'Litros calculados (histórico)')}
+      ${statCard('⏱️', totalHoras.toFixed(1) + ' h', 'Horas trabalhadas (histórico)')}
+      ${statCard('📊', consumoMedio.toFixed(2) + ' L/h', 'Consumo médio geral')}
+      ${statCard('🚜', equipamentosConhecidos.length, 'Equipamento(s) registrado(s)')}
+    </div>
+
+    <div class="bg-white border rounded-lg overflow-x-auto">
+      <table class="w-full text-sm">
+        <thead><tr class="text-left text-gray-500 border-b">
+          <th class="py-2 px-3">Data</th><th>Equipamento</th><th class="text-right">Horas trab.</th>
+          <th class="text-right">Litros (bomba)</th><th class="text-right">Informado</th><th class="text-right">Diferença</th>
+          <th class="text-right">L/h</th><th class="text-right">Valor</th><th></th>
+        </tr></thead>
+        <tbody>${registros.map(r => `<tr class="border-b last:border-0">
+          <td class="py-2 px-3">${fmtDate(r.data)}</td>
+          <td>${escapeHtml(r.equipamento)}</td>
+          <td class="text-right">${r.horas_trabalhadas ?? '-'}</td>
+          <td class="text-right">${r.litros_calculados ?? '-'}</td>
+          <td class="text-right">${r.quantidade_abastecida ?? '-'}</td>
+          <td class="text-right ${Math.abs(r.diferenca_litros || 0) > 2 ? 'text-red-600 font-medium' : 'text-green-700'}">${r.diferenca_litros ?? '-'}</td>
+          <td class="text-right">${r.consumo_l_h ?? '-'}</td>
+          <td class="text-right">${r.valor ? fmtMoney(r.valor) : '-'}</td>
+          <td class="text-right px-3"><button data-id="${r.id}" class="btnExcluirAbastecimento text-gray-400 hover:text-red-600">🗑️</button></td>
+        </tr>`).join('') || `<tr><td colspan="9" class="text-center text-gray-400 py-6">Nenhum abastecimento registrado</td></tr>`}</tbody>
+      </table>
+    </div>
+  `;
+
+  document.getElementById('btnNovoAbastecimento').onclick = () => formAbastecimento(equipamentosConhecidos);
+  document.querySelectorAll('.btnExcluirAbastecimento').forEach(b => {
+    b.onclick = async () => {
+      if (!confirmAction('Excluir este registro de abastecimento? (Um lançamento de custo vinculado, se houver, não é excluído automaticamente.)')) return;
+      await dbDelete('abastecimentos', b.dataset.id);
+      toast('Registro excluído', 'success');
+      pageCustos();
+    };
+  });
+}
+
+function formAbastecimento(equipamentosConhecidos = []) {
+  showModal('Novo abastecimento (por horímetro)', `
+    <form id="formAbastecimento" class="grid md:grid-cols-2 gap-x-3">
+      <datalist id="listaEquipamentos">${equipamentosConhecidos.map(e => `<option value="${escapeHtml(e)}">`).join('')}</datalist>
+      ${fld('Equipamento *', `<input name="equipamento" list="listaEquipamentos" required class="mt-1 w-full border rounded-md px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-brand-400" placeholder="ex.: Trator Massey 275">`)}
+      ${fld('Data', inp('data', todayISO(), 'date'))}
+      <div class="col-span-2 border-t pt-2 mt-1 mb-1"><p class="text-xs font-semibold text-gray-500 uppercase">Horímetro do trator</p></div>
+      ${fld('Horímetro inicial *', inp('horimetro_trator_inicial', '', 'number', 'step="0.1" required'))}
+      ${fld('Horímetro final *', inp('horimetro_trator_final', '', 'number', 'step="0.1" required'))}
+      <div class="col-span-2 border-t pt-2 mt-1 mb-1"><p class="text-xs font-semibold text-gray-500 uppercase">Contador da bomba de combustível</p></div>
+      ${fld('Contador inicial *', inp('horimetro_bomba_inicial', '', 'number', 'step="0.01" required'))}
+      ${fld('Contador final *', inp('horimetro_bomba_final', '', 'number', 'step="0.01" required'))}
+      <div class="col-span-2 bg-gray-50 border rounded-md p-3 text-sm my-2">
+        <div class="flex justify-between"><span>Horas trabalhadas:</span><strong id="calcHoras">0</strong></div>
+        <div class="flex justify-between"><span>Litros calculados (bomba):</span><strong id="calcLitros">0</strong></div>
+        <div class="flex justify-between"><span>Consumo:</span><strong id="calcConsumo">0 L/h</strong></div>
+      </div>
+      ${fld('Quantidade abastecida informada (L) *', inp('quantidade_abastecida', '', 'number', 'step="0.01" required'), 'col-span-2')}
+      <div class="col-span-2 text-sm -mt-2 mb-2">Diferença (informado − calculado pela bomba): <strong id="calcDiferenca">0</strong> L</div>
+      ${fld('Valor pago (R$, opcional — gera lançamento em Custos)', inp('valor', '', 'number', 'step="0.01"'), 'col-span-2')}
+      ${fld('Observações', txt('observacoes'), 'col-span-2')}
+      <div class="col-span-2 flex justify-end gap-2 mt-2">
+        <button type="button" id="btnCancelar" class="px-4 py-2 text-sm rounded-md border">Cancelar</button>
+        <button type="submit" id="btnSalvarAbastecimento" class="px-4 py-2 text-sm rounded-md bg-brand-600 hover:bg-brand-700 text-white">Salvar</button>
+      </div>
+    </form>
+  `, 'max-w-2xl');
+
+  const form = document.getElementById('formAbastecimento');
+  function recalcular() {
+    const hi = parseFloat(form.horimetro_trator_inicial.value) || 0;
+    const hf = parseFloat(form.horimetro_trator_final.value) || 0;
+    const bi = parseFloat(form.horimetro_bomba_inicial.value) || 0;
+    const bf = parseFloat(form.horimetro_bomba_final.value) || 0;
+    const informado = parseFloat(form.quantidade_abastecida.value) || 0;
+    const horas = hf - hi;
+    const litros = bf - bi;
+    const consumo = horas > 0 ? litros / horas : 0;
+    const diferenca = informado - litros;
+    document.getElementById('calcHoras').textContent = horas.toFixed(2);
+    document.getElementById('calcLitros').textContent = litros.toFixed(2);
+    document.getElementById('calcConsumo').textContent = consumo.toFixed(2) + ' L/h';
+    const difEl = document.getElementById('calcDiferenca');
+    difEl.textContent = diferenca.toFixed(2);
+    difEl.className = Math.abs(diferenca) > 2 ? 'text-red-600' : 'text-green-700';
+  }
+  ['horimetro_trator_inicial', 'horimetro_trator_final', 'horimetro_bomba_inicial', 'horimetro_bomba_final', 'quantidade_abastecida'].forEach(n => {
+    form[n].addEventListener('input', recalcular);
+  });
+
+  document.getElementById('btnCancelar').onclick = closeModal;
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const obj = formToObject(form);
+    const hi = Number(obj.horimetro_trator_inicial), hf = Number(obj.horimetro_trator_final);
+    const bi = Number(obj.horimetro_bomba_inicial), bf = Number(obj.horimetro_bomba_final);
+    const informado = Number(obj.quantidade_abastecida);
+    if (hf < hi) { toast('O horímetro final do trator não pode ser menor que o inicial', 'error'); return; }
+    if (bf < bi) { toast('O contador final da bomba não pode ser menor que o inicial', 'error'); return; }
+    const horas = Number((hf - hi).toFixed(2));
+    const litros = Number((bf - bi).toFixed(2));
+    const consumo = horas > 0 ? Number((litros / horas).toFixed(3)) : null;
+    const diferenca = Number((informado - litros).toFixed(2));
+    const valor = obj.valor ? Number(obj.valor) : null;
+
+    const btn = document.getElementById('btnSalvarAbastecimento');
+    btn.disabled = true;
+    try {
+      let custoId = null;
+      if (valor) {
+        const custo = await dbInsert('custos', {
+          categoria: 'combustivel',
+          descricao: `Abastecimento - ${obj.equipamento}`,
+          valor,
+          data: obj.data,
+          observacoes: `Gerado automaticamente pelo controle de combustível (${litros.toFixed(2)} L calculados na bomba / ${informado} L informados).`,
+        });
+        custoId = custo.id;
+      }
+      await dbInsert('abastecimentos', {
+        equipamento: obj.equipamento,
+        data: obj.data,
+        horimetro_trator_inicial: hi,
+        horimetro_trator_final: hf,
+        horas_trabalhadas: horas,
+        horimetro_bomba_inicial: bi,
+        horimetro_bomba_final: bf,
+        litros_calculados: litros,
+        quantidade_abastecida: informado,
+        diferenca_litros: diferenca,
+        consumo_l_h: consumo,
+        valor,
+        custo_id: custoId,
+        observacoes: obj.observacoes || null,
+      });
+      toast('Abastecimento registrado' + (custoId ? ' e custo lançado' : ''), 'success');
+      closeModal();
+      pageCustos();
+    } catch (err) {
+      btn.disabled = false;
+    }
+  });
+}
+
+// ------------------------------------------------------------
+// PÁGINA: ORÇAMENTOS (plano de contas: orçado x realizado)
+// ------------------------------------------------------------
+const MESES_ABREV = ['Jan', 'Fev', 'Mar', 'Abr', 'Mai', 'Jun', 'Jul', 'Ago', 'Set', 'Out', 'Nov', 'Dez'];
+let orcamentoAno = new Date().getFullYear();
+
+function fmtMoneyCompact(v) {
+  if (!v) return 'R$ 0';
+  return Number(v).toLocaleString('pt-BR', { style: 'currency', currency: 'BRL', maximumFractionDigits: 0 });
+}
+
+async function pageOrcamentos() {
+  const content = document.getElementById('page-content');
+  content.innerHTML = loading();
+
+  const inicioAno = `${orcamentoAno}-01-01`;
+  const fimAno = `${orcamentoAno}-12-31`;
+  const [orcamentos, custosDoAno] = await Promise.all([
+    dbSelect('orcamentos', { filters: [{ col: 'ano', val: orcamentoAno }] }),
+    dbSelect('custos', { select: 'categoria,valor,data', filters: [{ col: 'data', op: 'gte', val: inicioAno }, { col: 'data', op: 'lte', val: fimAno }] }),
+  ]);
+
+  const orcadoMap = {};
+  orcamentos.forEach(o => {
+    orcadoMap[o.categoria] = orcadoMap[o.categoria] || {};
+    orcadoMap[o.categoria][o.mes] = Number(o.valor_orcado) || 0;
+  });
+  const realizadoMap = {};
+  custosDoAno.forEach(c => {
+    const mes = Number((c.data || '').slice(5, 7));
+    if (!mes) return;
+    realizadoMap[c.categoria] = realizadoMap[c.categoria] || {};
+    realizadoMap[c.categoria][mes] = (realizadoMap[c.categoria][mes] || 0) + Number(c.valor || 0);
+  });
+
+  const categorias = CATEGORIAS_CUSTO.filter(c => c.value !== 'outros');
+  const totalCategoriaOrcado = (cat) => Object.values(orcadoMap[cat] || {}).reduce((s, v) => s + v, 0);
+  const totalCategoriaRealizado = (cat) => Object.values(realizadoMap[cat] || {}).reduce((s, v) => s + v, 0);
+  const totalMesOrcado = (mes) => categorias.reduce((s, c) => s + ((orcadoMap[c.value] || {})[mes] || 0), 0);
+  const totalMesRealizado = (mes) => categorias.reduce((s, c) => s + ((realizadoMap[c.value] || {})[mes] || 0), 0);
+  const totalAnoOrcado = categorias.reduce((s, c) => s + totalCategoriaOrcado(c.value), 0);
+  const totalAnoRealizado = categorias.reduce((s, c) => s + totalCategoriaRealizado(c.value), 0);
+  const pctExecutado = totalAnoOrcado ? (totalAnoRealizado / totalAnoOrcado * 100) : 0;
+
+  content.innerHTML = `
+    <div class="flex flex-wrap justify-between items-center gap-2 mb-4">
+      <h1 class="text-xl font-bold">Orçamentos</h1>
+      <div class="flex items-center gap-2">
+        <button id="btnAnoAnterior" class="px-2 py-1.5 rounded-md border bg-white text-sm">◀</button>
+        <span class="font-medium text-sm">${orcamentoAno}</span>
+        <button id="btnAnoProximo" class="px-2 py-1.5 rounded-md border bg-white text-sm">▶</button>
+      </div>
+    </div>
+
+    <p class="text-sm text-gray-600 mb-4">Defina o valor orçado por categoria (plano de contas) e mês — clique em um valor para editar. O "realizado" (linha menor, embaixo) é calculado automaticamente a partir dos lançamentos em Custos.</p>
+
+    <div class="grid grid-cols-2 md:grid-cols-4 gap-3 mb-6">
+      ${statCard('📐', fmtMoney(totalAnoOrcado), 'Total orçado no ano')}
+      ${statCard('💸', fmtMoney(totalAnoRealizado), 'Total realizado no ano')}
+      ${statCard(pctExecutado > 100 ? '⚠️' : '✅', pctExecutado.toFixed(0) + '%', 'Executado do orçamento')}
+      ${statCard('➖', fmtMoney(totalAnoOrcado - totalAnoRealizado), 'Saldo (orçado − realizado)')}
+    </div>
+
+    <div class="bg-white border rounded-lg overflow-x-auto">
+      <table class="w-full text-xs">
+        <thead>
+          <tr class="text-left text-gray-500 border-b">
+            <th class="py-2 px-3 sticky left-0 bg-white">Categoria</th>
+            ${MESES_ABREV.map(m => `<th class="text-center px-1 py-2">${m}</th>`).join('')}
+            <th class="text-center px-2 py-2 border-l">Total</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${categorias.map(c => `
+            <tr class="border-b last:border-0 align-top">
+              <td class="py-2 px-3 sticky left-0 bg-white font-medium whitespace-nowrap">${c.label}</td>
+              ${MESES_ABREV.map((m, i) => {
+                const mes = i + 1;
+                const orc = (orcadoMap[c.value] || {})[mes] || 0;
+                const rea = (realizadoMap[c.value] || {})[mes] || 0;
+                const over = rea > orc && orc > 0;
+                return `<td class="text-center px-1 py-1.5">
+                  <input type="number" step="0.01" data-cat="${c.value}" data-mes="${mes}" value="${orc || ''}" placeholder="0" class="orcadoInput w-16 text-center border rounded px-1 py-0.5 text-xs">
+                  <div class="text-[10px] mt-0.5 ${over ? 'text-red-600 font-semibold' : 'text-gray-400'}">${rea ? fmtMoneyCompact(rea) : '—'}</div>
+                </td>`;
+              }).join('')}
+              <td class="text-center px-2 py-1.5 border-l">
+                <div class="font-semibold">${fmtMoneyCompact(totalCategoriaOrcado(c.value))}</div>
+                <div class="text-[10px] ${totalCategoriaRealizado(c.value) > totalCategoriaOrcado(c.value) && totalCategoriaOrcado(c.value) > 0 ? 'text-red-600 font-semibold' : 'text-gray-400'}">${fmtMoneyCompact(totalCategoriaRealizado(c.value))}</div>
+              </td>
+            </tr>
+          `).join('')}
+          <tr class="font-semibold border-t-2 bg-gray-50">
+            <td class="py-2 px-3 sticky left-0 bg-gray-50">Total</td>
+            ${MESES_ABREV.map((m, i) => {
+              const mes = i + 1;
+              return `<td class="text-center px-1 py-1.5">
+                <div>${fmtMoneyCompact(totalMesOrcado(mes))}</div>
+                <div class="text-[10px] font-normal ${totalMesRealizado(mes) > totalMesOrcado(mes) && totalMesOrcado(mes) > 0 ? 'text-red-600' : 'text-gray-400'}">${fmtMoneyCompact(totalMesRealizado(mes))}</div>
+              </td>`;
+            }).join('')}
+            <td class="text-center px-2 py-1.5 border-l">
+              <div>${fmtMoneyCompact(totalAnoOrcado)}</div>
+              <div class="text-[10px] font-normal ${totalAnoRealizado > totalAnoOrcado ? 'text-red-600' : 'text-gray-400'}">${fmtMoneyCompact(totalAnoRealizado)}</div>
+            </td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="text-xs text-gray-400 mt-2">Em cada mês: valor de cima é o orçado (editável); valor de baixo é o realizado (somado dos lançamentos de Custos daquele mês/categoria).</p>
+  `;
+
+  document.getElementById('btnAnoAnterior').onclick = () => { orcamentoAno--; pageOrcamentos(); };
+  document.getElementById('btnAnoProximo').onclick = () => { orcamentoAno++; pageOrcamentos(); };
+
+  document.querySelectorAll('.orcadoInput').forEach(inputEl => {
+    inputEl.addEventListener('change', async () => {
+      const categoria = inputEl.dataset.cat;
+      const mes = Number(inputEl.dataset.mes);
+      const valor = Number(inputEl.value) || 0;
+      inputEl.disabled = true;
+      try {
+        await dbUpsert('orcamentos', { categoria, ano: orcamentoAno, mes, valor_orcado: valor }, 'categoria,ano,mes');
+      } catch (err) { /* erro já mostrado */ }
+      pageOrcamentos();
+    });
   });
 }
 
