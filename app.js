@@ -142,7 +142,8 @@ const NAV_ITEMS = [
   { route: 'reproducao', label: 'Reprodução', icon: '🍼' },
   { route: 'alimentacao', label: 'Alimentação', icon: '🌾' },
   { route: 'sanidade', label: 'Sanidade', icon: '💉' },
-  { route: 'custos', label: 'Custos', icon: '💰' },
+  { route: 'vendas', label: 'Vendas', icon: '💵' },
+  { route: 'custos', label: 'Financeiro', icon: '💰' },
   { route: 'orcamentos', label: 'Orçamentos', icon: '📐' },
   { route: 'relatorios', label: 'Relatórios', icon: '📑' },
 ];
@@ -216,6 +217,7 @@ const ROUTES = {
   reproducao: pageReproducao,
   alimentacao: pageAlimentacao,
   sanidade: pageSanidade,
+  vendas: pageVendas,
   custos: pageCustos,
   orcamentos: pageOrcamentos,
   relatorios: pageRelatorios,
@@ -2006,6 +2008,268 @@ async function formBaixa() {
 }
 
 // ------------------------------------------------------------
+// PÁGINA: VENDAS (seleção de animais em lote + baixa automática)
+// ------------------------------------------------------------
+let vendaFiltro = { busca: '', lote_id: '' };
+let vendaSelecionados = new Set();
+let vendaModo = 'total'; // 'total' (rateado igualmente) ou 'unitario' (valor por animal)
+let vendaValorTotalInput = '';
+let vendaValoresUnitarios = {}; // animal_id -> string digitado
+
+function recalcularResumoVenda() {
+  const qtd = vendaSelecionados.size;
+  const qtdEl = document.getElementById('qtdSelecionadosLabel');
+  if (qtdEl) qtdEl.textContent = qtd;
+  let total = 0;
+  if (vendaModo === 'total') {
+    const totalInput = document.getElementById('inputValorTotal');
+    total = totalInput ? (parseFloat(totalInput.value) || 0) : 0;
+    const unit = qtd > 0 ? total / qtd : 0;
+    const unitEl = document.getElementById('valorUnitCalculado');
+    if (unitEl) unitEl.textContent = fmtMoney(unit);
+  } else {
+    vendaSelecionados.forEach(id => { total += parseFloat(vendaValoresUnitarios[id]) || 0; });
+  }
+  const totalEl = document.getElementById('totalVendaResumo');
+  if (totalEl) totalEl.textContent = fmtMoney(total);
+  const btn = document.getElementById('btnConfirmarVenda');
+  if (btn) btn.disabled = qtd === 0;
+}
+
+async function pageVendas() {
+  const content = document.getElementById('page-content');
+  content.innerHTML = loading();
+  await refreshCaches();
+
+  const filters = [{ col: 'status', val: 'ativo' }];
+  if (vendaFiltro.lote_id) filters.push({ col: 'lote_id', val: vendaFiltro.lote_id });
+  let animais = await dbSelect('animais', {
+    select: '*, lote:lotes(id,nome,pasto:pastos(id,nome))',
+    filters,
+    order: { col: 'identificacao' },
+  });
+  if (vendaFiltro.busca) {
+    const b = vendaFiltro.busca.toLowerCase();
+    animais = animais.filter(a => (a.identificacao || '').toLowerCase().includes(b) || (a.nome || '').toLowerCase().includes(b));
+  }
+
+  const historicoHtml = await renderHistoricoVendasHtml();
+
+  content.innerHTML = `
+    <h1 class="text-xl font-bold mb-1">Vendas de animais</h1>
+    <p class="text-sm text-gray-600 mb-4">Selecione os animais vendidos, informe o valor (total do lote, dividido igualmente, ou um valor por animal) e confirme — o sistema dá baixa nos animais automaticamente.</p>
+
+    <div class="grid lg:grid-cols-3 gap-4 items-start">
+      <div class="lg:col-span-2">
+        <div class="bg-white border rounded-lg p-3 mb-3 flex flex-wrap gap-3 items-end">
+          <div>
+            <label class="text-xs font-medium text-gray-500">Buscar (brinco/nome)</label>
+            <input id="fBuscaVenda" value="${escapeHtml(vendaFiltro.busca)}" class="mt-1 border rounded-md px-3 py-1.5 text-sm">
+          </div>
+          <div>
+            <label class="text-xs font-medium text-gray-500">Lote</label>
+            <select id="fLoteVenda" class="mt-1 border rounded-md px-3 py-1.5 text-sm bg-white">${loteOptions(vendaFiltro.lote_id, false)}</select>
+          </div>
+          <button id="btnFiltrarVenda" class="bg-gray-100 hover:bg-gray-200 text-sm px-3 py-1.5 rounded-md">Filtrar</button>
+          <span class="text-sm text-gray-400 ml-auto">${animais.length} animal(is) ativo(s)</span>
+        </div>
+
+        <div class="bg-white border rounded-lg overflow-x-auto">
+          <table class="w-full text-sm">
+            <thead><tr class="text-left text-gray-500 border-b">
+              <th class="py-2 px-3"><input type="checkbox" id="chkSelecionarTodos"></th>
+              <th>Brinco</th><th>Nome</th><th>Categoria</th><th>Lote</th><th>Pasto</th>
+              <th class="text-right pr-3">Valor unitário</th>
+            </tr></thead>
+            <tbody>
+              ${animais.map(a => `
+                <tr class="border-b last:border-0 hover:bg-gray-50">
+                  <td class="py-2 px-3"><input type="checkbox" class="chkAnimalVenda" data-id="${a.id}" ${vendaSelecionados.has(a.id) ? 'checked' : ''}></td>
+                  <td class="font-medium">${escapeHtml(a.identificacao)}</td>
+                  <td>${escapeHtml(a.nome || '-')}</td>
+                  <td>${escapeHtml(a.categoria)}</td>
+                  <td>${a.lote ? escapeHtml(a.lote.nome) : '-'}</td>
+                  <td>${a.lote && a.lote.pasto ? escapeHtml(a.lote.pasto.nome) : '-'}</td>
+                  <td class="text-right pr-3">
+                    <input type="number" step="0.01" min="0" class="valorUnitInput w-24 text-right border rounded px-2 py-1 text-xs" data-id="${a.id}"
+                      value="${vendaValoresUnitarios[a.id] ?? ''}" placeholder="0,00" ${vendaModo !== 'unitario' || !vendaSelecionados.has(a.id) ? 'disabled' : ''}>
+                  </td>
+                </tr>`).join('') || `<tr><td colspan="7" class="text-center text-gray-400 py-6">Nenhum animal ativo encontrado</td></tr>`}
+            </tbody>
+          </table>
+        </div>
+
+        ${historicoHtml}
+      </div>
+
+      <div class="bg-white border rounded-lg p-4 lg:sticky lg:top-4">
+        <h2 class="font-semibold mb-3">Fechar venda</h2>
+        <div class="text-sm mb-3"><strong id="qtdSelecionadosLabel">${vendaSelecionados.size}</strong> animal(is) selecionado(s)</div>
+
+        <div class="flex gap-2 mb-3 text-sm">
+          <button type="button" id="btnModoTotal" class="flex-1 px-2 py-1.5 rounded-md border ${vendaModo === 'total' ? 'bg-brand-600 text-white border-brand-600' : 'bg-white'}">Valor total do lote</button>
+          <button type="button" id="btnModoUnit" class="flex-1 px-2 py-1.5 rounded-md border ${vendaModo === 'unitario' ? 'bg-brand-600 text-white border-brand-600' : 'bg-white'}">Valor por animal</button>
+        </div>
+
+        <div id="painelModoTotal" class="${vendaModo === 'total' ? '' : 'hidden'}">
+          ${fld('Valor total da venda (R$)', `<input id="inputValorTotal" type="number" step="0.01" min="0" value="${escapeHtml(vendaValorTotalInput)}" class="mt-1 w-full border rounded-md px-3 py-2 text-sm">`)}
+          <p class="text-xs text-gray-500 -mt-2 mb-2">Valor unitário calculado: <strong id="valorUnitCalculado">R$ 0,00</strong> (dividido igualmente entre os selecionados)</p>
+        </div>
+        <div id="painelModoUnit" class="text-xs text-gray-500 mb-2 ${vendaModo === 'unitario' ? '' : 'hidden'}">
+          Preencha o valor de cada animal selecionado na tabela ao lado.
+        </div>
+
+        <div class="border-t pt-3 mt-1 text-sm flex justify-between font-semibold">
+          <span>Valor total da venda:</span><span id="totalVendaResumo">R$ 0,00</span>
+        </div>
+
+        <div class="mt-3">
+          ${fld('Data da venda *', inp('dataVenda', todayISO(), 'date', 'required id="inputDataVenda"'))}
+          ${fld('Comprador', inp('compradorVenda', '', 'text', 'id="inputCompradorVenda"'))}
+          ${fld('Observações', txt('observacoesVenda').replace('<textarea', '<textarea id="inputObsVenda"'))}
+        </div>
+        <button id="btnConfirmarVenda" ${vendaSelecionados.size === 0 ? 'disabled' : ''} class="w-full mt-1 bg-brand-600 hover:bg-brand-700 disabled:opacity-40 disabled:cursor-not-allowed text-white font-medium py-2.5 rounded-md text-sm">Confirmar venda</button>
+      </div>
+    </div>
+  `;
+
+  document.getElementById('btnFiltrarVenda').onclick = () => {
+    vendaFiltro.busca = document.getElementById('fBuscaVenda').value;
+    vendaFiltro.lote_id = document.getElementById('fLoteVenda').value;
+    pageVendas();
+  };
+
+  document.getElementById('chkSelecionarTodos').onchange = (e) => {
+    animais.forEach(a => {
+      if (e.target.checked) vendaSelecionados.add(a.id); else vendaSelecionados.delete(a.id);
+    });
+    pageVendas();
+  };
+
+  document.querySelectorAll('.chkAnimalVenda').forEach(chk => {
+    chk.addEventListener('change', () => {
+      if (chk.checked) vendaSelecionados.add(chk.dataset.id); else vendaSelecionados.delete(chk.dataset.id);
+      const unitInput = document.querySelector(`.valorUnitInput[data-id="${chk.dataset.id}"]`);
+      if (unitInput) unitInput.disabled = vendaModo !== 'unitario' || !chk.checked;
+      recalcularResumoVenda();
+    });
+  });
+
+  document.querySelectorAll('.valorUnitInput').forEach(inputEl => {
+    inputEl.addEventListener('input', () => {
+      vendaValoresUnitarios[inputEl.dataset.id] = inputEl.value;
+      recalcularResumoVenda();
+    });
+  });
+
+  document.getElementById('btnModoTotal').onclick = () => { vendaModo = 'total'; pageVendas(); };
+  document.getElementById('btnModoUnit').onclick = () => { vendaModo = 'unitario'; pageVendas(); };
+
+  document.getElementById('inputValorTotal')?.addEventListener('input', (e) => {
+    vendaValorTotalInput = e.target.value;
+    recalcularResumoVenda();
+  });
+
+  document.getElementById('btnConfirmarVenda').onclick = () => confirmarVenda();
+
+  recalcularResumoVenda();
+}
+
+async function confirmarVenda() {
+  const ids = Array.from(vendaSelecionados);
+  if (ids.length === 0) { toast('Selecione ao menos um animal', 'error'); return; }
+  const data = document.getElementById('inputDataVenda').value || todayISO();
+  const comprador = document.getElementById('inputCompradorVenda').value || null;
+  const observacoes = document.getElementById('inputObsVenda').value || null;
+
+  const valoresPorAnimal = {};
+  if (vendaModo === 'total') {
+    const total = parseFloat(document.getElementById('inputValorTotal').value) || 0;
+    if (total <= 0) { toast('Informe o valor total da venda', 'error'); return; }
+    const n = ids.length;
+    const totalCents = Math.round(total * 100);
+    const baseCents = Math.floor(totalCents / n);
+    const restoCents = totalCents - baseCents * n;
+    ids.forEach((id, i) => {
+      valoresPorAnimal[id] = (baseCents + (i < restoCents ? 1 : 0)) / 100;
+    });
+  } else {
+    const faltando = [];
+    ids.forEach(id => {
+      const v = parseFloat(vendaValoresUnitarios[id]);
+      if (!v || v <= 0) faltando.push(id);
+      valoresPorAnimal[id] = v || 0;
+    });
+    if (faltando.length > 0) {
+      if (!confirmAction(`${faltando.length} animal(is) selecionado(s) está(ão) sem valor unitário preenchido (será salvo como R$ 0,00). Deseja continuar mesmo assim?`)) return;
+    }
+  }
+
+  const btn = document.getElementById('btnConfirmarVenda');
+  btn.disabled = true;
+  btn.textContent = 'Salvando...';
+  const vendaRef = 'V' + Date.now().toString(36).toUpperCase();
+  try {
+    const registrosBaixa = ids.map(id => ({
+      animal_id: id,
+      tipo: 'venda',
+      data,
+      motivo: 'Venda em lote',
+      valor: valoresPorAnimal[id],
+      comprador,
+      observacoes,
+      venda_ref: vendaRef,
+    }));
+    await inserirEmLotes('baixas', registrosBaixa);
+    const atualizacoesAnimais = ids.map(id => ({
+      id, status: 'vendido', data_saida: data, motivo_saida: 'Venda', valor_venda: valoresPorAnimal[id],
+    }));
+    await dbUpsert('animais', atualizacoesAnimais, 'id');
+    const totalVendido = Object.values(valoresPorAnimal).reduce((s, v) => s + v, 0);
+    toast(`Venda registrada: ${ids.length} animal(is), total ${fmtMoney(totalVendido)}`, 'success');
+    vendaSelecionados.clear();
+    vendaValoresUnitarios = {};
+    vendaValorTotalInput = '';
+    await refreshCaches();
+    pageVendas();
+  } catch (err) {
+    btn.disabled = false;
+    btn.textContent = 'Confirmar venda';
+  }
+}
+
+async function renderHistoricoVendasHtml() {
+  const vendas = await dbSelect('baixas', {
+    select: '*, animal:animal_id(identificacao)',
+    filters: [{ col: 'tipo', val: 'venda' }],
+    order: { col: 'data', asc: false },
+    limit: 500,
+  });
+  const grupos = {};
+  vendas.forEach(v => {
+    const chave = v.venda_ref || v.id;
+    if (!grupos[chave]) grupos[chave] = { data: v.data, comprador: v.comprador, itens: [], total: 0 };
+    grupos[chave].itens.push(v);
+    grupos[chave].total += Number(v.valor || 0);
+  });
+  const listaGrupos = Object.values(grupos).sort((a, b) => (a.data < b.data ? 1 : (a.data > b.data ? -1 : 0)));
+  return `
+    <div class="bg-white border rounded-lg overflow-x-auto mt-4">
+      <h2 class="font-semibold px-4 pt-4">Vendas realizadas</h2>
+      <table class="w-full text-sm mt-2">
+        <thead><tr class="text-left text-gray-500 border-b"><th class="py-2 px-3">Data</th><th>Comprador</th><th class="text-right">Qtd. animais</th><th class="text-right pr-3">Valor total</th></tr></thead>
+        <tbody>${listaGrupos.map(g => `<tr class="border-b last:border-0">
+          <td class="py-2 px-3">${fmtDate(g.data)}</td>
+          <td>${escapeHtml(g.comprador || '-')}</td>
+          <td class="text-right">${g.itens.length}</td>
+          <td class="text-right pr-3 font-medium">${fmtMoney(g.total)}</td>
+        </tr>`).join('') || `<tr><td colspan="4" class="text-center text-gray-400 py-6">Nenhuma venda registrada ainda</td></tr>`}</tbody>
+      </table>
+    </div>
+  `;
+}
+
+// ------------------------------------------------------------
 // PÁGINA: CUSTOS
 // ------------------------------------------------------------
 const CATEGORIAS_CUSTO = [
@@ -2023,19 +2287,31 @@ const CATEGORIAS_CUSTO = [
 let custosFiltro = { de: addDaysISO(todayISO(), -30), ate: todayISO(), categoria: '' };
 let custosTab = 'lancamentos';
 
+const CATEGORIAS_RECEITA = [
+  { value: 'venda_insumos', label: 'Venda de insumos/produtos (leite, feno, esterco...)' },
+  { value: 'arrendamento', label: 'Aluguel / arrendamento de pasto ou área' },
+  { value: 'prestacao_servico', label: 'Prestação de serviços' },
+  { value: 'subsidio', label: 'Subsídio / incentivo agrícola' },
+  { value: 'rendimento_financeiro', label: 'Rendimento financeiro' },
+  { value: 'outros', label: 'Outras receitas' },
+];
+let receitasFiltro = { de: addDaysISO(todayISO(), -30), ate: todayISO(), categoria: '' };
+
 async function pageCustos() {
   const content = document.getElementById('page-content');
   content.innerHTML = loading();
   await refreshCaches();
 
-  content.innerHTML = `<h1 class="text-xl font-bold mb-4">Custos</h1><div id="custosTabs"></div><div id="custosContent"></div>`;
+  content.innerHTML = `<h1 class="text-xl font-bold mb-4">Financeiro</h1><div id="custosTabs"></div><div id="custosContent"></div>`;
   document.getElementById('custosTabs').innerHTML = tabsBar([
-    { key: 'lancamentos', label: 'Lançamentos' },
+    { key: 'lancamentos', label: 'Custos' },
     { key: 'combustivel', label: '⛽ Combustível' },
+    { key: 'entradas', label: '💵 Entradas' },
   ], custosTab);
   document.querySelectorAll('#custosTabs .tabBtn').forEach(b => { b.onclick = () => { custosTab = b.dataset.tab; pageCustos(); }; });
 
   if (custosTab === 'combustivel') await renderCustosCombustivel();
+  else if (custosTab === 'entradas') await renderReceitas();
   else await renderCustosLancamentos();
 }
 
@@ -2145,6 +2421,108 @@ function formCusto() {
       toast('Custo lançado', 'success');
       closeModal();
       pageCustos();
+    } catch (err) {
+      btn.disabled = false;
+      btn.textContent = 'Salvar';
+    }
+  });
+}
+
+// ------------------------------------------------------------
+// FINANCEIRO: ENTRADAS (receitas que não são venda de gado —
+// essas ficam registradas em "Vendas", como baixa dos animais)
+// ------------------------------------------------------------
+async function renderReceitas() {
+  const content = document.getElementById('custosContent');
+  content.innerHTML = loading();
+  const filters = [{ col: 'data', op: 'gte', val: receitasFiltro.de }, { col: 'data', op: 'lte', val: receitasFiltro.ate }];
+  if (receitasFiltro.categoria) filters.push({ col: 'categoria', val: receitasFiltro.categoria });
+  const receitas = await dbSelect('receitas', { filters, order: { col: 'data', asc: false } });
+  const total = receitas.reduce((s, r) => s + Number(r.valor || 0), 0);
+
+  content.innerHTML = `
+    <div class="flex flex-wrap justify-end items-center gap-2 mb-4">
+      <button id="btnNovaReceita" class="bg-brand-600 hover:bg-brand-700 text-white text-sm font-medium px-4 py-2 rounded-md">+ Nova entrada</button>
+    </div>
+
+    <div class="bg-white border rounded-lg p-3 mb-4 flex flex-wrap gap-3 items-end">
+      <div><label class="text-xs font-medium text-gray-500">De</label><input id="rDe" type="date" value="${receitasFiltro.de}" class="mt-1 border rounded-md px-3 py-1.5 text-sm block"></div>
+      <div><label class="text-xs font-medium text-gray-500">Até</label><input id="rAte" type="date" value="${receitasFiltro.ate}" class="mt-1 border rounded-md px-3 py-1.5 text-sm block"></div>
+      <div><label class="text-xs font-medium text-gray-500">Categoria</label><select id="rCategoria" class="mt-1 border rounded-md px-3 py-1.5 text-sm bg-white block">${sel('_', [{ value: '', label: 'Todas' }, ...CATEGORIAS_RECEITA], receitasFiltro.categoria).replace(/<\/?select[^>]*>/g, '')}</select></div>
+      <button id="btnFiltrarReceita" class="bg-gray-100 hover:bg-gray-200 text-sm px-3 py-1.5 rounded-md">Filtrar</button>
+    </div>
+
+    <div class="grid grid-cols-2 md:grid-cols-4 gap-3 mb-6">
+      ${statCard('💵', fmtMoney(total), 'Total de entradas no período')}
+    </div>
+
+    <div class="bg-white border rounded-lg overflow-x-auto">
+      <table class="w-full text-sm">
+        <thead><tr class="text-left text-gray-500 border-b"><th class="py-2 px-3">Data</th><th>Categoria</th><th>Descrição</th><th class="text-right">Valor</th><th></th><th></th></tr></thead>
+        <tbody>${receitas.map(r => `<tr class="border-b last:border-0">
+          <td class="py-2 px-3">${fmtDate(r.data)}</td>
+          <td>${CATEGORIAS_RECEITA.find(x => x.value === r.categoria)?.label || r.categoria}</td>
+          <td>${escapeHtml(r.descricao)}</td>
+          <td class="text-right">${fmtMoney(r.valor)}</td>
+          <td class="text-center px-1">${r.anexo_path ? `<a href="${anexoUrl(r.anexo_path)}" target="_blank" rel="noopener" title="Ver anexo">📎</a>` : ''}</td>
+          <td class="text-right px-3"><button data-id="${r.id}" class="btnExcluirReceita text-gray-400 hover:text-red-600">🗑️</button></td>
+        </tr>`).join('') || `<tr><td colspan="6" class="text-center text-gray-400 py-6">Nenhuma entrada lançada no período</td></tr>`}</tbody>
+      </table>
+    </div>
+  `;
+
+  document.getElementById('btnNovaReceita').onclick = () => formReceita();
+  document.getElementById('btnFiltrarReceita').onclick = () => {
+    receitasFiltro.de = document.getElementById('rDe').value;
+    receitasFiltro.ate = document.getElementById('rAte').value;
+    receitasFiltro.categoria = document.getElementById('rCategoria').value;
+    renderReceitas();
+  };
+  document.querySelectorAll('.btnExcluirReceita').forEach(b => {
+    b.onclick = async () => {
+      if (!confirmAction('Excluir esta entrada financeira?')) return;
+      await dbDelete('receitas', b.dataset.id);
+      toast('Entrada excluída', 'success');
+      renderReceitas();
+    };
+  });
+}
+
+function formReceita() {
+  showModal('Nova entrada financeira', `
+    <form id="formReceita">
+      ${fld('Categoria *', sel('categoria', CATEGORIAS_RECEITA, 'outros', 'required'))}
+      ${fld('Descrição *', inp('descricao', '', 'text', 'required'))}
+      ${fld('Valor (R$) *', inp('valor', '', 'number', 'step="0.01" required'))}
+      ${fld('Data', inp('data', todayISO(), 'date'))}
+      ${fld('Observações', txt('observacoes'))}
+      ${fld('Anexar comprovante (opcional)', '<input type="file" name="anexo_file" accept="image/*,.pdf" capture="environment" class="mt-1 w-full text-sm">', '')}
+      <div class="flex justify-end gap-2 mt-2">
+        <button type="button" id="btnCancelar" class="px-4 py-2 text-sm rounded-md border">Cancelar</button>
+        <button type="submit" id="btnSalvarReceita" class="px-4 py-2 text-sm rounded-md bg-brand-600 hover:bg-brand-700 text-white">Salvar</button>
+      </div>
+    </form>
+  `);
+  document.getElementById('btnCancelar').onclick = closeModal;
+  document.getElementById('formReceita').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const form = e.target;
+    const fileInput = form.querySelector('[name=anexo_file]');
+    const arquivo = fileInput?.files?.[0] || null;
+    const obj = formToObject(form);
+    delete obj.anexo_file;
+    obj.valor = Number(obj.valor);
+    const btn = document.getElementById('btnSalvarReceita');
+    btn.disabled = true;
+    try {
+      if (arquivo) {
+        btn.textContent = 'Enviando anexo...';
+        obj.anexo_path = await uploadAnexo(arquivo, 'receitas');
+      }
+      await dbInsert('receitas', obj);
+      toast('Entrada lançada', 'success');
+      closeModal();
+      renderReceitas();
     } catch (err) {
       btn.disabled = false;
       btn.textContent = 'Salvar';
