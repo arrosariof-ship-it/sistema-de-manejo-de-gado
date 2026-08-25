@@ -2867,6 +2867,21 @@ async function pageRelatorios() {
       </table>
     </div>
 
+    <div class="bg-white border rounded-lg p-4 mb-6">
+      <h2 class="font-semibold mb-1">📊 Exportar dados para Power BI / Excel</h2>
+      <p class="text-sm text-gray-500 mb-3">Cada botão baixa um arquivo .csv detalhado (uma linha por registro), pronto para importar no Power BI (<em>Obter Dados → Texto/CSV</em>) ou no Excel. Para um painel que atualiza sozinho sem precisar exportar toda vez, veja a dica de conexão direta ao banco de dados logo abaixo.</p>
+      <div class="grid sm:grid-cols-2 lg:grid-cols-3 gap-2">
+        <button id="btnExpAnimaisLocalizacao" class="text-sm px-3 py-2 rounded-md border bg-gray-50 hover:bg-gray-100 text-left">🐄 Animais e localização (pasto/lote)</button>
+        <button id="btnExpMovimentacoes" class="text-sm px-3 py-2 rounded-md border bg-gray-50 hover:bg-gray-100 text-left">🚚 Movimentações entre pastos</button>
+        <button id="btnExpVendas" class="text-sm px-3 py-2 rounded-md border bg-gray-50 hover:bg-gray-100 text-left">💵 Vendas de animais</button>
+        <button id="btnExpCustos" class="text-sm px-3 py-2 rounded-md border bg-gray-50 hover:bg-gray-100 text-left">💰 Custos</button>
+        <button id="btnExpReceitas" class="text-sm px-3 py-2 rounded-md border bg-gray-50 hover:bg-gray-100 text-left">💵 Entradas financeiras</button>
+        <button id="btnExpReproducao" class="text-sm px-3 py-2 rounded-md border bg-gray-50 hover:bg-gray-100 text-left">🍼 Eventos reprodutivos</button>
+        <button id="btnExpSanidade" class="text-sm px-3 py-2 rounded-md border bg-gray-50 hover:bg-gray-100 text-left">💉 Registros sanitários</button>
+      </div>
+      <p class="text-xs text-gray-400 mt-3">💡 Dica: no Power BI Desktop, use <em>Obter Dados → Banco de Dados PostgreSQL</em> com os dados de conexão do seu projeto Supabase (Configurações → Database) para montar um painel que atualiza sozinho, sem precisar exportar CSV toda vez. Peça pra mim se quiser o passo a passo.</p>
+    </div>
+
     <div class="grid md:grid-cols-2 gap-6">
       <div class="bg-white border rounded-lg p-4">
         <h2 class="font-semibold mb-3">Rebanho por categoria</h2>
@@ -2896,6 +2911,60 @@ async function pageRelatorios() {
     const headers = ['Pasto', 'Lote', 'Finalidade', 'Qtd. animais', '% do rebanho'];
     const rows = linhas.map(l => [l.pasto, l.lote, l.finalidade, l.qtd, l.pct + '%']);
     downloadCSV('rebanho_por_lote_pasto.csv', headers, rows);
+  };
+
+  document.getElementById('btnExpAnimaisLocalizacao').onclick = async () => {
+    const todos = await dbSelect('animais', { select: '*, lote:lotes(id,nome,pasto:pastos(id,nome))', order: { col: 'identificacao' } });
+    const headers = ['Brinco', 'Nome', 'Sexo', 'Categoria', 'Raça', 'Data Nascimento', 'Peso Atual', 'Status', 'Lote', 'Pasto', 'Data Saída', 'Motivo Saída', 'Valor Venda'];
+    const rows = todos.map(a => [
+      a.identificacao, a.nome || '', a.sexo, a.categoria, a.raca || '',
+      a.data_nascimento || '', a.peso_atual ?? '', a.status,
+      a.lote ? a.lote.nome : '', a.lote && a.lote.pasto ? a.lote.pasto.nome : '',
+      a.data_saida || '', a.motivo_saida || '', a.valor_venda ?? '',
+    ]);
+    downloadCSV('animais_localizacao.csv', headers, rows);
+  };
+
+  document.getElementById('btnExpMovimentacoes').onclick = async () => {
+    const dados = await dbSelect('movimentacoes', { select: '*, lote:lotes(nome), origem:pasto_origem_id(nome), destino:pasto_destino_id(nome)', order: { col: 'data', asc: false } });
+    const headers = ['Data', 'Lote', 'Pasto Origem', 'Pasto Destino', 'Qtd Animais', 'Responsável', 'Motivo'];
+    const rows = dados.map(m => [m.data, m.lote ? m.lote.nome : '', m.origem ? m.origem.nome : '', m.destino ? m.destino.nome : '', m.quantidade_animais ?? '', m.responsavel || '', m.motivo || '']);
+    downloadCSV('movimentacoes.csv', headers, rows);
+  };
+
+  document.getElementById('btnExpVendas').onclick = async () => {
+    const dados = await dbSelect('baixas', { select: '*, animal:animal_id(identificacao,categoria)', filters: [{ col: 'tipo', val: 'venda' }], order: { col: 'data', asc: false } });
+    const headers = ['Data', 'Referência da Venda', 'Brinco', 'Categoria', 'Comprador', 'Valor'];
+    const rows = dados.map(b => [b.data, b.venda_ref || '', b.animal ? b.animal.identificacao : '', b.animal ? b.animal.categoria : '', b.comprador || '', b.valor ?? '']);
+    downloadCSV('vendas.csv', headers, rows);
+  };
+
+  document.getElementById('btnExpCustos').onclick = async () => {
+    const dados = await dbSelect('custos', { select: '*, lote:lote_id(nome), pasto:pasto_id(nome)', order: { col: 'data', asc: false } });
+    const headers = ['Data', 'Categoria', 'Descrição', 'Valor', 'Lote', 'Pasto', 'NF Número', 'NF Fornecedor'];
+    const rows = dados.map(c => [c.data, CATEGORIAS_CUSTO.find(x => x.value === c.categoria)?.label || c.categoria, c.descricao, c.valor, c.lote ? c.lote.nome : '', c.pasto ? c.pasto.nome : '', c.nf_numero || '', c.nf_fornecedor || '']);
+    downloadCSV('custos.csv', headers, rows);
+  };
+
+  document.getElementById('btnExpReceitas').onclick = async () => {
+    const dados = await dbSelect('receitas', { order: { col: 'data', asc: false } });
+    const headers = ['Data', 'Categoria', 'Descrição', 'Valor'];
+    const rows = dados.map(r => [r.data, CATEGORIAS_RECEITA.find(x => x.value === r.categoria)?.label || r.categoria, r.descricao, r.valor]);
+    downloadCSV('entradas_financeiras.csv', headers, rows);
+  };
+
+  document.getElementById('btnExpReproducao').onclick = async () => {
+    const dados = await dbSelect('eventos_reprodutivos', { select: '*, animal:animal_id(identificacao)', order: { col: 'data', asc: false } });
+    const headers = ['Data', 'Brinco', 'Tipo Evento', 'Resultado', 'Data Prevista Parto', 'Touro/Sêmen', 'Peso Bezerro', 'Sexo Bezerro'];
+    const rows = dados.map(e => [e.data, e.animal ? e.animal.identificacao : '', e.tipo_evento, e.resultado || '', e.data_prevista_parto || '', e.touro_semen || '', e.peso_bezerro ?? '', e.sexo_bezerro || '']);
+    downloadCSV('eventos_reprodutivos.csv', headers, rows);
+  };
+
+  document.getElementById('btnExpSanidade').onclick = async () => {
+    const dados = await dbSelect('registros_sanitarios', { select: '*, animal:animal_id(identificacao), lote:lote_id(nome)', order: { col: 'data', asc: false } });
+    const headers = ['Data', 'Brinco', 'Lote', 'Tipo', 'Nome', 'Medicamento', 'Custo', 'Status'];
+    const rows = dados.map(r => [r.data, r.animal ? r.animal.identificacao : '', r.lote ? r.lote.nome : '', r.tipo, r.nome, r.medicamento || '', r.custo ?? '', r.status || '']);
+    downloadCSV('registros_sanitarios.csv', headers, rows);
   };
 
   // reprodução
