@@ -396,6 +396,17 @@ async function dbUpdate(table, id, obj) {
   }
   return data[0];
 }
+// Atualiza vários registros já existentes (cada um identificado por "id"),
+// cada um só com os campos que estão mudando — usa UPDATE de verdade
+// (não upsert), porque um upsert monta um INSERT por baixo dos panos e
+// exige valores para toda coluna NOT NULL sem default (ex.: "identificacao"
+// em "animais"), mesmo quando a intenção é só atualizar uma linha existente.
+async function dbUpdateEmLote(table, registros) {
+  return Promise.all(registros.map(r => {
+    const { id, ...campos } = r;
+    return dbUpdate(table, id, campos);
+  }));
+}
 async function dbDelete(table, id) {
   const { error } = await sb.from(table).delete().eq('id', id);
   if (error) {
@@ -757,7 +768,7 @@ function importarPesagensCSV() {
       const atualizacoesAnimais = Object.entries(maisRecentePorAnimal)
         .filter(([, v]) => !v.peso_atual_data_anterior || v.data >= v.peso_atual_data_anterior)
         .map(([id, v]) => ({ id, peso_atual: v.peso, peso_atual_data: v.data }));
-      if (atualizacoesAnimais.length) await dbUpsert('animais', atualizacoesAnimais, 'id');
+      if (atualizacoesAnimais.length) await dbUpdateEmLote('animais', atualizacoesAnimais);
 
       toast(`${novasPesagens.length} pesagem(ns) importada(s)${naoEncontrados.length ? `, ${naoEncontrados.length} brinco(s) não encontrado(s)` : ''}${semPesoValido.length ? `, ${semPesoValido.length} sem peso válido` : ''}`, naoEncontrados.length || semPesoValido.length ? 'error' : 'success');
       closeModal();
@@ -823,7 +834,7 @@ function corrigirSexoCategoriaCSV() {
         else semAlteracao.push(identificacao || nomeBusca);
       });
 
-      if (atualizacoes.length) await dbUpsert('animais', atualizacoes, 'id');
+      if (atualizacoes.length) await dbUpdateEmLote('animais', atualizacoes);
 
       toast(`${atualizacoes.length} animal(is) corrigido(s)${naoEncontrados.length ? `, ${naoEncontrados.length} não encontrado(s)` : ''}${semAlteracao.length ? `, ${semAlteracao.length} já estavam certos` : ''}`, atualizacoes.length ? 'success' : 'error');
       closeModal();
@@ -1893,7 +1904,7 @@ function importarPrevisaoPartosCSV() {
 
       if (registros.length) {
         await inserirEmLotes('eventos_reprodutivos', registros);
-        if (atualizacoesNome.length) await dbUpsert('animais', atualizacoesNome, 'id');
+        if (atualizacoesNome.length) await dbUpdateEmLote('animais', atualizacoesNome);
         toast(`${registros.length} previsão(ões) de parto importada(s)${atualizacoesNome.length ? `, ${atualizacoesNome.length} nome(s) de animal atualizado(s)` : ''}${naoEncontrados.length ? `, ${naoEncontrados.length} animal(is) não encontrado(s)` : ''}${semData.length ? `, ${semData.length} sem data válida` : ''}`, naoEncontrados.length || semData.length ? 'error' : 'success');
       } else {
         toast('Nenhuma linha pôde ser importada — veja o detalhe abaixo do que travou', 'error');
@@ -2592,7 +2603,7 @@ async function confirmarVenda() {
     const atualizacoesAnimais = ids.map(id => ({
       id, status: 'vendido', data_saida: data, motivo_saida: 'Venda', valor_venda: valoresPorAnimal[id],
     }));
-    await dbUpsert('animais', atualizacoesAnimais, 'id');
+    await dbUpdateEmLote('animais', atualizacoesAnimais);
     const totalVendido = Object.values(valoresPorAnimal).reduce((s, v) => s + v, 0);
     toast(`Venda registrada: ${ids.length} animal(is), total ${fmtMoney(totalVendido)}`, 'success');
     vendaSelecionados.clear();
