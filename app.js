@@ -1842,7 +1842,7 @@ async function renderReproEventos() {
         <thead><tr class="text-left text-gray-500 border-b"><th class="py-2 px-3">Data</th><th>Animal</th><th>Evento</th><th>Resultado</th><th>Prev. parto</th></tr></thead>
         <tbody>${eventos.map(e => `<tr class="border-b last:border-0">
           <td class="py-2 px-3">${fmtDate(e.data)}</td>
-          <td><a class="text-brand-700 hover:underline" href="#animal/${e.animal_id}">${escapeHtml(e.animal?.identificacao || '')}</a></td>
+          <td><a class="text-brand-700 hover:underline" href="#animal/${e.animal_id}">${escapeHtml(e.animal?.nome || e.animal?.identificacao || '')}</a></td>
           <td>${labelEvento(e.tipo_evento)}</td>
           <td>${e.resultado || '-'}</td>
           <td>${e.data_prevista_parto ? fmtDate(e.data_prevista_parto) : '-'}</td>
