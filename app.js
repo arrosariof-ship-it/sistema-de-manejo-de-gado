@@ -1857,10 +1857,10 @@ async function renderReproEventos() {
 function importarPrevisaoPartosCSV() {
   formImportarCSV({
     titulo: 'Importar previsão de partos (planilha de prenhez)',
-    instrucoes: 'Cada linha vira um evento de "Inseminação artificial" (ou monta) já com a previsão de parto preenchida. Só funciona pra animais já cadastrados no Rebanho — o brinco/RGN precisa ser igual ao já cadastrado (se não bater, tento casar pelo nome do animal como alternativa). Se a coluna "Nome" for mapeada, também atualizo o nome cadastrado do animal para o valor da planilha.',
+    instrucoes: 'Cada linha vira um evento de "Inseminação artificial" (ou monta) já com a previsão de parto preenchida. Só funciona pra animais já cadastrados no Rebanho. Casamento por brinco é opcional — se o brinco cadastrado no sistema for outra coisa (ex.: número do chip) e não bater, mapeie a coluna do RGN/RGD no campo "Nome / RGN / RGD" abaixo, que é por aí que eu vou casar com o animal.',
     campos: [
-      { key: 'identificacao', label: 'Brinco / RGN do animal', obrigatorio: true },
-      { key: 'nome', label: 'Nome do animal (usado se o brinco não bater)' },
+      { key: 'identificacao', label: 'Brinco do animal (opcional)' },
+      { key: 'nome', label: 'Nome / RGN / RGD do animal (como está cadastrado no Rebanho)', obrigatorio: true },
       { key: 'touro', label: 'Touro / sêmen utilizado' },
       { key: 'data_ia', label: 'Data da I.A. / cobertura', obrigatorio: true },
       { key: 'data_prevista_parto', label: 'Data prevista de parto', obrigatorio: true },
@@ -1877,8 +1877,6 @@ function importarPrevisaoPartosCSV() {
       const registros = [];
       const naoEncontrados = [];
       const semData = [];
-      const atualizacoesNome = [];
-      const idsComNomeAtualizado = new Set();
       rows.forEach(r => {
         const identificacao = get(r, 'identificacao');
         const nome = get(r, 'nome');
@@ -1896,16 +1894,14 @@ function importarPrevisaoPartosCSV() {
           touro_semen: get(r, 'touro') || null,
           data_prevista_parto: dataPrevista,
         });
-        if (nome && nome !== (animal.nome || '') && !idsComNomeAtualizado.has(animal.id)) {
-          idsComNomeAtualizado.add(animal.id);
-          atualizacoesNome.push({ id: animal.id, nome });
-        }
+        // Nota: por enquanto NÃO atualizamos o campo "nome" do animal aqui
+        // (o valor mapeado nesse importador é o RGN/RGD usado só pra
+        // localizar o animal, não necessariamente um nome novo pra gravar).
       });
 
       if (registros.length) {
         await inserirEmLotes('eventos_reprodutivos', registros);
-        if (atualizacoesNome.length) await dbUpdateEmLote('animais', atualizacoesNome);
-        toast(`${registros.length} previsão(ões) de parto importada(s)${atualizacoesNome.length ? `, ${atualizacoesNome.length} nome(s) de animal atualizado(s)` : ''}${naoEncontrados.length ? `, ${naoEncontrados.length} animal(is) não encontrado(s)` : ''}${semData.length ? `, ${semData.length} sem data válida` : ''}`, naoEncontrados.length || semData.length ? 'error' : 'success');
+        toast(`${registros.length} previsão(ões) de parto importada(s)${naoEncontrados.length ? `, ${naoEncontrados.length} animal(is) não encontrado(s)` : ''}${semData.length ? `, ${semData.length} sem data válida` : ''}`, naoEncontrados.length || semData.length ? 'error' : 'success');
       } else {
         toast('Nenhuma linha pôde ser importada — veja o detalhe abaixo do que travou', 'error');
       }
