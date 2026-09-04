@@ -708,6 +708,103 @@ function importarPastosCSV() {
   });
 }
 
+// Importa pesagens de qualquer app/balança que consiga exportar um arquivo
+// (CSV, XLS ou XLSX) com o chip/brinco e o peso de cada animal pesado.
+// Grava cada pesagem no histórico (tabela "pesagens", usada para calcular
+// GMD e comparar com a pesagem anterior) e mantém o peso atual do animal
+// sincronizado com a pesagem mais recente. Só atualiza animais já
+// cadastrados (casando pelo brinco/identificação) — não cria animais novos.
+function importarPesagensCSV() {
+  formImportarCSV({
+    titulo: 'Importar pesagens de arquivo do app de pesagem',
+    instrucoes: 'Funciona com a exportação de qualquer app ou balança — por exemplo, apps de leitura de RFID com balança Bluetooth acoplada (ex.: balanças Coimma) costumam ter um botão "Exportar" ou "Compartilhar" que gera um arquivo CSV/XLSX com o chip e o peso de cada animal pesado. Selecione esse arquivo aqui. Só atualiza animais que já estão cadastrados no Rebanho — o brinco/chip precisa ser igual ao já cadastrado.',
+    campos: [
+      { key: 'identificacao', label: 'Brinco / Chip / identificação do animal', obrigatorio: true },
+      { key: 'peso', label: 'Peso (kg)', obrigatorio: true },
+      { key: 'data', label: 'Data da pesagem (opcional — usa hoje se vazio)' },
+    ],
+    onImportar: async (rows, mapping, fixos) => {
+      const get = (r, k) => (mapping[k] !== undefined ? (r[mapping[k]] || '').trim() : (fixos[k] || ''));
+      const animaisAtivos = await dbSelect('animais', { select: 'id,identificacao,peso_atual_data', filters: [{ col: 'status', val: 'ativo' }] });
+      const porIdentificacao = {};
+      animaisAtivos.forEach(a => { porIdentificacao[(a.identificacao || '').trim().toLowerCase()] = a; });
+
+      const novasPesagens = [];
+      const maisRecentePorAnimal = {}; // id -> { peso, data } — só a pesagem mais nova deste lote, por animal
+      const naoEncontrados = [];
+      const semPesoValido = [];
+      rows.forEach(r => {
+        const identificacao = get(r, 'identificacao');
+        if (!identificacao) return;
+        const pesoTexto = get(r, 'peso');
+        const peso = pesoTexto ? Number(String(pesoTexto).replace(',', '.')) : NaN;
+        if (!pesoTexto || isNaN(peso) || peso <= 0) { semPesoValido.push(identificacao); return; }
+        const animal = porIdentificacao[identificacao.toLowerCase()];
+        if (!animal) { naoEncontrados.push(identificacao); return; }
+        const data = parseDataFlexivel(get(r, 'data')) || todayISO();
+        novasPesagens.push({ animal_id: animal.id, peso, data });
+        const atual = maisRecentePorAnimal[animal.id];
+        if (!atual || data >= atual.data) maisRecentePorAnimal[animal.id] = { peso, data, peso_atual_data_anterior: animal.peso_atual_data };
+      });
+
+      if (!novasPesagens.length) {
+        toast('Nenhum brinco do arquivo bateu com animais ativos já cadastrados (confira o mapeamento de colunas)', 'error');
+        return;
+      }
+      await inserirEmLotes('pesagens', novasPesagens);
+
+      // só atualiza o peso "atual" do animal se a pesagem importada for igual/mais nova que a que já estava registrada
+      const atualizacoesAnimais = Object.entries(maisRecentePorAnimal)
+        .filter(([, v]) => !v.peso_atual_data_anterior || v.data >= v.peso_atual_data_anterior)
+        .map(([id, v]) => ({ id, peso_atual: v.peso, peso_atual_data: v.data }));
+      if (atualizacoesAnimais.length) await dbUpsert('animais', atualizacoesAnimais, 'id');
+
+      toast(`${novasPesagens.length} pesagem(ns) importada(s)${naoEncontrados.length ? `, ${naoEncontrados.length} brinco(s) não encontrado(s)` : ''}${semPesoValido.length ? `, ${semPesoValido.length} sem peso válido` : ''}`, naoEncontrados.length || semPesoValido.length ? 'error' : 'success');
+      closeModal();
+      await refreshCaches();
+      pageAnimais();
+
+      if (naoEncontrados.length) {
+        showModal('Brincos não encontrados', `
+          <p class="text-sm text-gray-600 mb-3">Esses ${naoEncontrados.length} brinco(s) do arquivo de pesagem não bateram com nenhum animal ativo já cadastrado no sistema. Confira se não há erro de digitação, ou se o animal ainda não foi cadastrado no Rebanho.</p>
+          <div class="max-h-64 overflow-y-auto border rounded-md p-2 text-sm font-mono">${naoEncontrados.map(id => escapeHtml(id)).join('<br>')}</div>
+          <div class="flex justify-end mt-3"><button type="button" id="btnFecharNaoEncontrados" class="px-4 py-2 text-sm rounded-md border">Fechar</button></div>
+        `);
+        document.getElementById('btnFecharNaoEncontrados').onclick = closeModal;
+      }
+    },
+  });
+}
+
+// ------------------------------------------------------------
+// PESO / GMD — comparação com a pesagem anterior
+// ------------------------------------------------------------
+// Recebe as pesagens de UM animal (em qualquer ordem) e retorna a mais
+// recente, a anterior a ela, a diferença de peso e o GMD (kg/dia) entre
+// as duas. Retorna null se não houver nenhuma pesagem.
+function comparativoPeso(pesagensDoAnimal) {
+  if (!pesagensDoAnimal || !pesagensDoAnimal.length) return null;
+  const ordenadas = [...pesagensDoAnimal].sort((a, b) => (a.data < b.data ? 1 : (a.data > b.data ? -1 : 0)));
+  const atual = ordenadas[0];
+  const anterior = ordenadas[1] || null;
+  if (!anterior) return { atual, anterior: null, diferenca: null, dias: null, gmd: null };
+  const diferenca = Number((Number(atual.peso) - Number(anterior.peso)).toFixed(1));
+  const dias = daysBetween(anterior.data, atual.data);
+  const gmd = dias > 0 ? Number((diferenca / dias).toFixed(3)) : null;
+  return { atual, anterior, diferenca, dias, gmd };
+}
+
+// Badge compacto: seta + valor ganho/perdido (+ GMD quando houver pesagem anterior)
+function comparativoPesoBadgeHtml(comp) {
+  if (!comp) return '<span class="text-gray-300">—</span>';
+  if (!comp.anterior) return `<span class="text-gray-700">${comp.atual.peso} kg</span> <span class="text-xs text-gray-400">(1ª pesagem)</span>`;
+  const cor = comp.diferenca > 0 ? 'text-green-600' : (comp.diferenca < 0 ? 'text-red-600' : 'text-gray-500');
+  const seta = comp.diferenca > 0 ? '▲' : (comp.diferenca < 0 ? '▼' : '▬');
+  const sinal = comp.diferenca > 0 ? '+' : '';
+  return `<span class="text-gray-700">${comp.atual.peso} kg</span> <span class="${cor} font-medium">${seta} ${sinal}${comp.diferenca} kg</span>` +
+    (comp.gmd !== null ? ` <span class="text-xs text-gray-400">(GMD ${comp.gmd >= 0 ? '+' : ''}${comp.gmd} kg/dia)</span>` : '');
+}
+
 // aceita "1.234,56", "R$ 1.234,56", "1234.56" etc.
 function parseValorFlexivel(v) {
   if (v === null || v === undefined || v === '') return NaN;
@@ -735,6 +832,24 @@ function normalizarCategoria(v) {
     [['assinatura', 'mensalidade', 'software', 'sistema', 'streaming'], 'assinaturas'],
     [['investimento', 'maquinario', 'maquinário', 'implemento', 'trator novo', 'benfeitoria'], 'investimentos'],
     [['imposto', 'taxa', 'itr', 'funrural'], 'impostos_taxas'],
+  ];
+  for (const [chaves, cat] of mapa) {
+    if (chaves.some(k => s.includes(k))) return cat;
+  }
+  return null;
+}
+
+// tenta reconhecer a categoria de receita pelo texto da planilha
+function normalizarCategoriaReceita(v) {
+  const s = (v || '').trim().toLowerCase();
+  if (!s) return null;
+  if (CATEGORIAS_RECEITA.some(c => c.value === s)) return s;
+  const mapa = [
+    [['insumo', 'leite', 'feno', 'esterco', 'silagem', 'venda de'], 'venda_insumos'],
+    [['arrend', 'aluguel', 'aluguer', 'locac'], 'arrendamento'],
+    [['servico', 'serviço', 'prestac'], 'prestacao_servico'],
+    [['subsidio', 'subsídio', 'incentivo', 'programa'], 'subsidio'],
+    [['rendimento', 'juros', 'aplicac', 'financeir'], 'rendimento_financeiro'],
   ];
   for (const [chaves, cat] of mapa) {
     if (chaves.some(k => s.includes(k))) return cat;
@@ -785,6 +900,45 @@ function importarLancamentosCSV() {
       toast(`Importação concluída: ${sucesso} lançamento(s) importado(s)${falhas ? `, ${falhas} com erro` : ''}${avisoIgnorados}`, falhas ? 'error' : 'success');
       closeModal();
       pageCustos();
+    },
+  });
+}
+
+function importarReceitasCSV() {
+  formImportarCSV({
+    titulo: 'Importar entradas financeiras (planilha Excel/CSV)',
+    instrucoes: 'Selecione a planilha de entradas/receitas que não são venda de gado (venda de insumos, arrendamento, prestação de serviço, subsídio, rendimento financeiro etc.). Indique abaixo qual coluna é a descrição, o valor, a data etc.',
+    campos: [
+      { key: 'descricao', label: 'Descrição da entrada', obrigatorio: true },
+      { key: 'valor', label: 'Valor (R$)', obrigatorio: true },
+      { key: 'data', label: 'Data', obrigatorio: true, permiteFixo: true },
+      { key: 'categoria', label: 'Categoria', permiteFixo: true },
+      { key: 'observacoes', label: 'Observações' },
+    ],
+    onImportar: async (rows, mapping, fixos) => {
+      const get = (r, k) => (mapping[k] !== undefined ? (r[mapping[k]] || '').trim() : (fixos[k] || ''));
+      let semValor = 0;
+      const registros = rows.map(r => {
+        const valor = parseValorFlexivel(get(r, 'valor'));
+        if (!get(r, 'descricao') || isNaN(valor) || valor <= 0) { semValor++; return null; }
+        return {
+          descricao: get(r, 'descricao'),
+          valor,
+          data: parseDataFlexivel(get(r, 'data')) || todayISO(),
+          categoria: normalizarCategoriaReceita(get(r, 'categoria')) || 'outros',
+          observacoes: get(r, 'observacoes') || null,
+        };
+      }).filter(Boolean);
+
+      if (!registros.length) {
+        toast('Nenhuma entrada válida (confira as colunas de descrição e valor)', 'error');
+        return;
+      }
+      const { sucesso, falhas } = await inserirEmLotes('receitas', registros);
+      const avisoIgnorados = semValor ? `, ${semValor} linha(s) ignorada(s) por falta de descrição/valor` : '';
+      toast(`Importação concluída: ${sucesso} entrada(s) importada(s)${falhas ? `, ${falhas} com erro` : ''}${avisoIgnorados}`, falhas ? 'error' : 'success');
+      closeModal();
+      renderReceitas();
     },
   });
 }
@@ -1060,11 +1214,25 @@ async function pageAnimais() {
     animais = animais.filter(a => (a.identificacao || '').toLowerCase().includes(b) || (a.nome || '').toLowerCase().includes(b));
   }
 
+  const idsAnimais = animais.map(a => a.id);
+  const pesagensPorAnimal = {};
+  if (idsAnimais.length) {
+    const todasPesagens = await dbSelect('pesagens', {
+      select: 'id,animal_id,peso,data',
+      filters: [{ col: 'animal_id', op: 'in', val: idsAnimais }],
+      order: { col: 'data', asc: false },
+    });
+    todasPesagens.forEach(p => {
+      (pesagensPorAnimal[p.animal_id] = pesagensPorAnimal[p.animal_id] || []).push(p);
+    });
+  }
+
   content.innerHTML = `
     <div class="flex flex-wrap justify-between items-center gap-2 mb-4">
       <h1 class="text-xl font-bold">Rebanho</h1>
       <div class="flex gap-2">
         <button id="btnImportarAnimais" class="bg-white border text-sm font-medium px-4 py-2 rounded-md hover:bg-gray-50">📥 Importar CSV</button>
+        <button id="btnImportarPesagens" class="bg-white border text-sm font-medium px-4 py-2 rounded-md hover:bg-gray-50">⚖️ Importar pesagens</button>
         <button id="btnNovoAnimal" class="bg-brand-600 hover:bg-brand-700 text-white text-sm font-medium px-4 py-2 rounded-md">+ Novo animal</button>
       </div>
     </div>
@@ -1095,7 +1263,7 @@ async function pageAnimais() {
     <div class="bg-white border rounded-lg overflow-x-auto">
       <table class="w-full text-sm">
         <thead><tr class="text-left text-gray-500 border-b">
-          <th class="py-2 px-3">Brinco</th><th>Nome</th><th>Sexo</th><th>Categoria</th><th>Lote</th><th>Pasto</th><th>Status</th><th></th>
+          <th class="py-2 px-3">Brinco</th><th>Nome</th><th>Sexo</th><th>Categoria</th><th>Lote</th><th>Pasto</th><th>Peso</th><th>Status</th><th></th>
         </tr></thead>
         <tbody>
           ${animais.map(a => `
@@ -1106,9 +1274,10 @@ async function pageAnimais() {
               <td>${escapeHtml(a.categoria)}</td>
               <td>${a.lote ? escapeHtml(a.lote.nome) : '-'}</td>
               <td>${a.lote && a.lote.pasto ? escapeHtml(a.lote.pasto.nome) : '-'}</td>
+              <td class="whitespace-nowrap">${comparativoPesoBadgeHtml(comparativoPeso(pesagensPorAnimal[a.id] || (a.peso_atual ? [{ peso: a.peso_atual, data: a.peso_atual_data || '' }] : [])))}</td>
               <td><span class="px-2 py-0.5 rounded-full text-xs ${statusBadge(a.status)}">${a.status}</span></td>
               <td class="text-right px-3"><button data-id="${a.id}" class="btnEditarAnimal text-gray-400 hover:text-brand-700">✏️</button></td>
-            </tr>`).join('') || `<tr><td colspan="8" class="text-center text-gray-400 py-6">Nenhum animal encontrado</td></tr>`}
+            </tr>`).join('') || `<tr><td colspan="9" class="text-center text-gray-400 py-6">Nenhum animal encontrado</td></tr>`}
         </tbody>
       </table>
     </div>
@@ -1116,6 +1285,7 @@ async function pageAnimais() {
 
   document.getElementById('btnNovoAnimal').onclick = () => formAnimal();
   document.getElementById('btnImportarAnimais').onclick = () => importarAnimaisCSV();
+  document.getElementById('btnImportarPesagens').onclick = () => importarPesagensCSV();
   document.getElementById('btnFiltrar').onclick = () => {
     animaisFiltro.busca = document.getElementById('fBusca').value;
     animaisFiltro.status = document.getElementById('fStatus').value;
@@ -1192,17 +1362,20 @@ async function pageAnimalDetalhe(id) {
   const content = document.getElementById('page-content');
   content.innerHTML = loading();
 
-  const [animal, eventos, sanitarios, baixasList] = await Promise.all([
+  const [animal, eventos, sanitarios, baixasList, pesagens] = await Promise.all([
     dbSelectOne('animais', id, '*, lote:lotes(id,nome,pasto:pastos(id,nome)), mae:mae_id(id,identificacao)'),
     dbSelect('eventos_reprodutivos', { filters: [{ col: 'animal_id', val: id }], order: { col: 'data', asc: false } }),
     dbSelect('registros_sanitarios', { filters: [{ col: 'animal_id', val: id }], order: { col: 'data', asc: false } }),
     dbSelect('baixas', { filters: [{ col: 'animal_id', val: id }], order: { col: 'data', asc: false } }),
+    dbSelect('pesagens', { filters: [{ col: 'animal_id', val: id }], order: { col: 'data', asc: false } }),
   ]);
 
   if (!animal) {
     content.innerHTML = `<p class="text-gray-500">Animal não encontrado.</p><a href="#animais" class="text-brand-700 hover:underline">Voltar</a>`;
     return;
   }
+
+  const compPrincipal = comparativoPeso(pesagens.length ? pesagens : (animal.peso_atual ? [{ peso: animal.peso_atual, data: animal.peso_atual_data || '' }] : []));
 
   content.innerHTML = `
     <a href="#animais" class="text-sm text-brand-700 hover:underline">&larr; Voltar ao rebanho</a>
@@ -1225,7 +1398,7 @@ async function pageAnimalDetalhe(id) {
       </div>
       <div class="bg-white border rounded-lg p-4">
         <div class="text-xs text-gray-500">Peso atual</div>
-        <div class="font-medium">${animal.peso_atual ? animal.peso_atual + ' kg' : '—'} ${animal.peso_atual_data ? '(' + fmtDate(animal.peso_atual_data) + ')' : ''}</div>
+        <div class="font-medium">${comparativoPesoBadgeHtml(compPrincipal)}</div>
       </div>
     </div>
 
@@ -1246,12 +1419,60 @@ async function pageAnimalDetalhe(id) {
       </div>
     </div>
 
+    <div class="bg-white border rounded-lg p-4 mt-6">
+      <div class="flex justify-between items-center mb-3">
+        <h2 class="font-semibold">Histórico de pesagens</h2>
+        <button id="btnRegistrarPesagem" class="bg-white border text-sm font-medium px-3 py-1.5 rounded-md hover:bg-gray-50">⚖️ + Registrar pesagem</button>
+      </div>
+      <table class="w-full text-sm">
+        <thead><tr class="text-left text-gray-500 border-b"><th class="py-1">Data</th><th>Peso</th><th>Variação</th><th>GMD desde a pesagem anterior</th></tr></thead>
+        <tbody>${pesagens.map((p, i) => {
+          const c = comparativoPeso(pesagens.slice(i));
+          const varTxt = c && c.anterior ? `<span class="${c.diferenca > 0 ? 'text-green-600' : (c.diferenca < 0 ? 'text-red-600' : 'text-gray-500')} font-medium">${c.diferenca > 0 ? '▲' : (c.diferenca < 0 ? '▼' : '▬')} ${c.diferenca > 0 ? '+' : ''}${c.diferenca} kg</span>` : '<span class="text-gray-300">—</span>';
+          const gmdTxt = c && c.gmd !== null ? `${c.gmd >= 0 ? '+' : ''}${c.gmd} kg/dia` : '—';
+          return `<tr class="border-b last:border-0"><td class="py-1">${fmtDate(p.data)}</td><td>${p.peso} kg</td><td>${varTxt}</td><td class="text-gray-500">${gmdTxt}</td></tr>`;
+        }).join('') || `<tr><td colspan="4" class="text-gray-400 text-center py-3">Nenhuma pesagem registrada</td></tr>`}</tbody>
+      </table>
+    </div>
+
     ${baixasList.length ? `
     <div class="bg-white border rounded-lg p-4 mt-6">
       <h2 class="font-semibold mb-3">Baixa registrada</h2>
       ${baixasList.map(b => `<p class="text-sm">${b.tipo} em ${fmtDate(b.data)} — ${escapeHtml(b.motivo || '')} ${b.valor ? '· ' + fmtMoney(b.valor) : ''}</p>`).join('')}
     </div>` : ''}
   `;
+
+  document.getElementById('btnRegistrarPesagem').onclick = () => formPesagem(animal);
+}
+
+function formPesagem(animal) {
+  showModal('Registrar pesagem', `
+    <form id="formPesagem" class="grid grid-cols-2 gap-x-3">
+      ${fld('Peso (kg) *', inp('peso', '', 'number', 'step="0.1" required'))}
+      ${fld('Data *', inp('data', todayISO(), 'date', 'required'))}
+      ${fld('Observações', txt('observacoes', ''), 'col-span-2')}
+      <div class="col-span-2 flex justify-end gap-2 mt-2">
+        <button type="button" id="btnCancelarPesagem" class="px-4 py-2 text-sm rounded-md border">Cancelar</button>
+        <button type="submit" class="px-4 py-2 text-sm rounded-md bg-brand-600 hover:bg-brand-700 text-white">Salvar</button>
+      </div>
+    </form>
+  `);
+  document.getElementById('btnCancelarPesagem').onclick = closeModal;
+  document.getElementById('formPesagem').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const obj = formToObject(e.target);
+    obj.peso = Number(obj.peso);
+    obj.animal_id = animal.id;
+    try {
+      await dbInsert('pesagens', obj);
+      if (!animal.peso_atual_data || obj.data >= animal.peso_atual_data) {
+        await dbUpdate('animais', animal.id, { peso_atual: obj.peso, peso_atual_data: obj.data });
+      }
+      toast('Pesagem registrada', 'success');
+      closeModal();
+      pageAnimalDetalhe(animal.id);
+    } catch (err) { /* toast já mostrado */ }
+  });
 }
 
 function labelEvento(tipo) {
@@ -2442,6 +2663,7 @@ async function renderReceitas() {
 
   content.innerHTML = `
     <div class="flex flex-wrap justify-end items-center gap-2 mb-4">
+      <button id="btnImportarReceitas" class="bg-white border text-sm font-medium px-4 py-2 rounded-md hover:bg-gray-50">📥 Importar planilha (Excel/CSV)</button>
       <button id="btnNovaReceita" class="bg-brand-600 hover:bg-brand-700 text-white text-sm font-medium px-4 py-2 rounded-md">+ Nova entrada</button>
     </div>
 
@@ -2472,6 +2694,7 @@ async function renderReceitas() {
   `;
 
   document.getElementById('btnNovaReceita').onclick = () => formReceita();
+  document.getElementById('btnImportarReceitas').onclick = () => importarReceitasCSV();
   document.getElementById('btnFiltrarReceita').onclick = () => {
     receitasFiltro.de = document.getElementById('rDe').value;
     receitasFiltro.ate = document.getElementById('rAte').value;
@@ -2878,6 +3101,7 @@ async function pageRelatorios() {
         <button id="btnExpReceitas" class="text-sm px-3 py-2 rounded-md border bg-gray-50 hover:bg-gray-100 text-left">💵 Entradas financeiras</button>
         <button id="btnExpReproducao" class="text-sm px-3 py-2 rounded-md border bg-gray-50 hover:bg-gray-100 text-left">🍼 Eventos reprodutivos</button>
         <button id="btnExpSanidade" class="text-sm px-3 py-2 rounded-md border bg-gray-50 hover:bg-gray-100 text-left">💉 Registros sanitários</button>
+        <button id="btnExpPesagens" class="text-sm px-3 py-2 rounded-md border bg-gray-50 hover:bg-gray-100 text-left">⚖️ Pesagens (histórico e GMD)</button>
       </div>
       <p class="text-xs text-gray-400 mt-3">💡 Dica: no Power BI Desktop, use <em>Obter Dados → Banco de Dados PostgreSQL</em> com os dados de conexão do seu projeto Supabase (Configurações → Database) para montar um painel que atualiza sozinho, sem precisar exportar CSV toda vez. Peça pra mim se quiser o passo a passo.</p>
     </div>
@@ -2965,6 +3189,26 @@ async function pageRelatorios() {
     const headers = ['Data', 'Brinco', 'Lote', 'Tipo', 'Nome', 'Medicamento', 'Custo', 'Status'];
     const rows = dados.map(r => [r.data, r.animal ? r.animal.identificacao : '', r.lote ? r.lote.nome : '', r.tipo, r.nome, r.medicamento || '', r.custo ?? '', r.status || '']);
     downloadCSV('registros_sanitarios.csv', headers, rows);
+  };
+
+  document.getElementById('btnExpPesagens').onclick = async () => {
+    const dados = await dbSelect('pesagens', { select: '*, animal:animal_id(identificacao)', order: { col: 'animal_id' } });
+    const porAnimalExp = {};
+    dados.forEach(p => { (porAnimalExp[p.animal_id] = porAnimalExp[p.animal_id] || []).push(p); });
+    const headers = ['Brinco', 'Data', 'Peso (kg)', 'Variação (kg)', 'Dias desde pesagem anterior', 'GMD (kg/dia)', 'Observações'];
+    const rows = [];
+    Object.values(porAnimalExp).forEach(lista => {
+      const ordenadas = [...lista].sort((a, b) => (a.data < b.data ? -1 : (a.data > b.data ? 1 : 0)));
+      ordenadas.forEach((p, i) => {
+        const c = comparativoPeso(ordenadas.slice(0, i + 1).reverse());
+        rows.push([
+          p.animal ? p.animal.identificacao : '', p.data, p.peso,
+          c && c.anterior ? c.diferenca : '', c && c.anterior ? c.dias : '', c && c.anterior ? c.gmd : '',
+          p.observacoes || '',
+        ]);
+      });
+    });
+    downloadCSV('pesagens_gmd.csv', headers, rows);
   };
 
   // reprodução
