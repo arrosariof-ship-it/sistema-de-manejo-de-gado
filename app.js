@@ -1755,7 +1755,10 @@ async function renderReproEventos() {
     order: { col: 'data', asc: false }, limit: 150,
   });
   document.getElementById('reproContent').innerHTML = `
-    <div class="flex justify-end mb-3"><button id="btnNovoEvento" class="bg-brand-600 hover:bg-brand-700 text-white text-sm font-medium px-4 py-2 rounded-md">+ Registrar evento</button></div>
+    <div class="flex flex-wrap justify-end gap-2 mb-3">
+      <button id="btnImportarPrevisaoPartos" class="bg-white border text-sm font-medium px-4 py-2 rounded-md hover:bg-gray-50">📥 Importar previsão de partos</button>
+      <button id="btnNovoEvento" class="bg-brand-600 hover:bg-brand-700 text-white text-sm font-medium px-4 py-2 rounded-md">+ Registrar evento</button>
+    </div>
     <div class="bg-white border rounded-lg overflow-x-auto">
       <table class="w-full text-sm">
         <thead><tr class="text-left text-gray-500 border-b"><th class="py-2 px-3">Data</th><th>Animal</th><th>Evento</th><th>Resultado</th><th>Prev. parto</th></tr></thead>
@@ -1770,6 +1773,78 @@ async function renderReproEventos() {
     </div>
   `;
   document.getElementById('btnNovoEvento').onclick = () => formEventoReprodutivo();
+  document.getElementById('btnImportarPrevisaoPartos').onclick = () => importarPrevisaoPartosCSV();
+}
+
+function importarPrevisaoPartosCSV() {
+  formImportarCSV({
+    titulo: 'Importar previsão de partos (planilha de prenhez)',
+    instrucoes: 'Cada linha vira um evento de "Inseminação artificial" (ou monta) já com a previsão de parto preenchida. Só funciona pra animais já cadastrados no Rebanho — o brinco/RGN precisa ser igual ao já cadastrado (se não bater, tento casar pelo nome do animal como alternativa). Se a coluna "Nome" for mapeada, também atualizo o nome cadastrado do animal para o valor da planilha.',
+    campos: [
+      { key: 'identificacao', label: 'Brinco / RGN do animal', obrigatorio: true },
+      { key: 'nome', label: 'Nome do animal (usado se o brinco não bater)' },
+      { key: 'touro', label: 'Touro / sêmen utilizado' },
+      { key: 'data_ia', label: 'Data da I.A. / cobertura', obrigatorio: true },
+      { key: 'data_prevista_parto', label: 'Data prevista de parto', obrigatorio: true },
+    ],
+    onImportar: async (rows, mapping, fixos) => {
+      const get = (r, k) => (mapping[k] !== undefined ? (r[mapping[k]] || '').trim() : (fixos[k] || ''));
+      const porIdentificacao = {};
+      const porNome = {};
+      femeasCache.forEach(f => {
+        porIdentificacao[(f.identificacao || '').trim().toLowerCase()] = f;
+        if (f.nome) porNome[f.nome.trim().toLowerCase()] = f;
+      });
+
+      const registros = [];
+      const naoEncontrados = [];
+      const semData = [];
+      const atualizacoesNome = [];
+      const idsComNomeAtualizado = new Set();
+      rows.forEach(r => {
+        const identificacao = get(r, 'identificacao');
+        const nome = get(r, 'nome');
+        if (!identificacao && !nome) return;
+        const dataIA = parseDataFlexivel(get(r, 'data_ia'));
+        const dataPrevista = parseDataFlexivel(get(r, 'data_prevista_parto'));
+        if (!dataIA || !dataPrevista) { semData.push(identificacao || nome); return; }
+        let animal = identificacao ? porIdentificacao[identificacao.toLowerCase()] : null;
+        if (!animal && nome) animal = porNome[nome.toLowerCase()];
+        if (!animal) { naoEncontrados.push(identificacao || nome); return; }
+        registros.push({
+          animal_id: animal.id,
+          tipo_evento: 'inseminacao',
+          data: dataIA,
+          touro_semen: get(r, 'touro') || null,
+          data_prevista_parto: dataPrevista,
+        });
+        if (nome && nome !== (animal.nome || '') && !idsComNomeAtualizado.has(animal.id)) {
+          idsComNomeAtualizado.add(animal.id);
+          atualizacoesNome.push({ id: animal.id, nome });
+        }
+      });
+
+      if (!registros.length) {
+        toast('Nenhuma linha válida para importar (confira o mapeamento de colunas)', 'error');
+        return;
+      }
+      await inserirEmLotes('eventos_reprodutivos', registros);
+      if (atualizacoesNome.length) await dbUpsert('animais', atualizacoesNome, 'id');
+
+      toast(`${registros.length} previsão(ões) de parto importada(s)${atualizacoesNome.length ? `, ${atualizacoesNome.length} nome(s) de animal atualizado(s)` : ''}${naoEncontrados.length ? `, ${naoEncontrados.length} animal(is) não encontrado(s)` : ''}${semData.length ? `, ${semData.length} sem data válida` : ''}`, naoEncontrados.length || semData.length ? 'error' : 'success');
+      closeModal();
+      pageReproducao();
+
+      if (naoEncontrados.length) {
+        showModal('Animais não encontrados', `
+          <p class="text-sm text-gray-600 mb-3">Esses ${naoEncontrados.length} animal(is) da planilha não bateram com nenhuma fêmea ativa cadastrada no Rebanho (nem pelo brinco, nem pelo nome). Confira se não há erro de digitação ou se o animal ainda não foi cadastrado.</p>
+          <div class="max-h-64 overflow-y-auto border rounded-md p-2 text-sm font-mono">${naoEncontrados.map(id => escapeHtml(id)).join('<br>')}</div>
+          <div class="flex justify-end mt-3"><button type="button" id="btnFecharNaoEncontrados" class="px-4 py-2 text-sm rounded-md border">Fechar</button></div>
+        `);
+        document.getElementById('btnFecharNaoEncontrados').onclick = closeModal;
+      }
+    },
+  });
 }
 
 function formEventoReprodutivo() {
