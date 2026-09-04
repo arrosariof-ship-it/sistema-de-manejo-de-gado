@@ -777,6 +777,64 @@ function importarPesagensCSV() {
 }
 
 // ------------------------------------------------------------
+// CORREÇÃO EM LOTE DE SEXO/CATEGORIA
+// (útil quando uma importação anterior gravou tudo com o mesmo sexo
+// por engano — busca em TODOS os animais, não só os ativos/fêmeas)
+// ------------------------------------------------------------
+function corrigirSexoCategoriaCSV() {
+  formImportarCSV({
+    titulo: 'Corrigir sexo/categoria em lote',
+    instrucoes: 'Use isso se algum animal ficou cadastrado com o sexo ou a categoria errada (por exemplo, se uma importação anterior marcou o rebanho todo como macho por engano). Cada linha atualiza o animal já cadastrado com esse brinco — não cria animal novo. Se não souber a categoria de cada um, pode deixar essa coluna sem mapear e corrigir só o sexo.',
+    campos: [
+      { key: 'identificacao', label: 'Brinco / RGN do animal', obrigatorio: true },
+      { key: 'sexo', label: 'Sexo correto (F ou M)', permiteFixo: true },
+      { key: 'categoria', label: 'Categoria correta (Vaca, Novilha, Touro, Boi...)', permiteFixo: true },
+    ],
+    onImportar: async (rows, mapping, fixos) => {
+      const get = (r, k) => (mapping[k] !== undefined ? (r[mapping[k]] || '').trim() : (fixos[k] || ''));
+      const todosAnimais = await dbSelect('animais', { select: 'id,identificacao,sexo,categoria' });
+      const porIdentificacao = {};
+      todosAnimais.forEach(a => { porIdentificacao[(a.identificacao || '').trim().toLowerCase()] = a; });
+
+      const atualizacoes = [];
+      const naoEncontrados = [];
+      const semAlteracao = [];
+      rows.forEach(r => {
+        const identificacao = get(r, 'identificacao');
+        if (!identificacao) return;
+        const animal = porIdentificacao[identificacao.toLowerCase()];
+        if (!animal) { naoEncontrados.push(identificacao); return; }
+        const sexoTxt = get(r, 'sexo').toUpperCase();
+        const sexo = sexoTxt === 'F' || sexoTxt === 'FEMEA' || sexoTxt === 'FÊMEA' ? 'F'
+          : sexoTxt === 'M' || sexoTxt === 'MACHO' ? 'M' : null;
+        const categoria = get(r, 'categoria');
+        const upd = { id: animal.id };
+        let mudou = false;
+        if (sexo && sexo !== animal.sexo) { upd.sexo = sexo; mudou = true; }
+        if (categoria && categoria !== animal.categoria) { upd.categoria = categoria; mudou = true; }
+        if (mudou) atualizacoes.push(upd);
+        else semAlteracao.push(identificacao);
+      });
+
+      if (atualizacoes.length) await dbUpsert('animais', atualizacoes, 'id');
+
+      toast(`${atualizacoes.length} animal(is) corrigido(s)${naoEncontrados.length ? `, ${naoEncontrados.length} não encontrado(s)` : ''}${semAlteracao.length ? `, ${semAlteracao.length} já estavam certos` : ''}`, atualizacoes.length ? 'success' : 'error');
+      closeModal();
+      pageAnimais();
+
+      if (naoEncontrados.length) {
+        showModal('Animais não encontrados', `
+          <p class="text-sm text-gray-600 mb-3">Esses ${naoEncontrados.length} brinco(s) não bateram com nenhum animal cadastrado (de nenhum status).</p>
+          <div class="max-h-64 overflow-y-auto border rounded-md p-2 text-sm font-mono">${naoEncontrados.map(id => escapeHtml(id)).join('<br>')}</div>
+          <div class="flex justify-end mt-3"><button type="button" id="btnFecharNaoEncontrados" class="px-4 py-2 text-sm rounded-md border">Fechar</button></div>
+        `);
+        document.getElementById('btnFecharNaoEncontrados').onclick = closeModal;
+      }
+    },
+  });
+}
+
+// ------------------------------------------------------------
 // PESO / GMD — comparação com a pesagem anterior
 // ------------------------------------------------------------
 // Recebe as pesagens de UM animal (em qualquer ordem) e retorna a mais
@@ -1233,6 +1291,7 @@ async function pageAnimais() {
       <div class="flex gap-2">
         <button id="btnImportarAnimais" class="bg-white border text-sm font-medium px-4 py-2 rounded-md hover:bg-gray-50">📥 Importar CSV</button>
         <button id="btnImportarPesagens" class="bg-white border text-sm font-medium px-4 py-2 rounded-md hover:bg-gray-50">⚖️ Importar pesagens</button>
+        <button id="btnCorrigirSexo" class="bg-white border text-sm font-medium px-4 py-2 rounded-md hover:bg-gray-50">🔧 Corrigir sexo/categoria em lote</button>
         <button id="btnNovoAnimal" class="bg-brand-600 hover:bg-brand-700 text-white text-sm font-medium px-4 py-2 rounded-md">+ Novo animal</button>
       </div>
     </div>
@@ -1286,6 +1345,7 @@ async function pageAnimais() {
   document.getElementById('btnNovoAnimal').onclick = () => formAnimal();
   document.getElementById('btnImportarAnimais').onclick = () => importarAnimaisCSV();
   document.getElementById('btnImportarPesagens').onclick = () => importarPesagensCSV();
+  document.getElementById('btnCorrigirSexo').onclick = () => corrigirSexoCategoriaCSV();
   document.getElementById('btnFiltrar').onclick = () => {
     animaisFiltro.busca = document.getElementById('fBusca').value;
     animaisFiltro.status = document.getElementById('fStatus').value;
@@ -1824,24 +1884,29 @@ function importarPrevisaoPartosCSV() {
         }
       });
 
-      if (!registros.length) {
-        toast('Nenhuma linha válida para importar (confira o mapeamento de colunas)', 'error');
-        return;
+      if (registros.length) {
+        await inserirEmLotes('eventos_reprodutivos', registros);
+        if (atualizacoesNome.length) await dbUpsert('animais', atualizacoesNome, 'id');
+        toast(`${registros.length} previsão(ões) de parto importada(s)${atualizacoesNome.length ? `, ${atualizacoesNome.length} nome(s) de animal atualizado(s)` : ''}${naoEncontrados.length ? `, ${naoEncontrados.length} animal(is) não encontrado(s)` : ''}${semData.length ? `, ${semData.length} sem data válida` : ''}`, naoEncontrados.length || semData.length ? 'error' : 'success');
+      } else {
+        toast('Nenhuma linha pôde ser importada — veja o detalhe abaixo do que travou', 'error');
       }
-      await inserirEmLotes('eventos_reprodutivos', registros);
-      if (atualizacoesNome.length) await dbUpsert('animais', atualizacoesNome, 'id');
-
-      toast(`${registros.length} previsão(ões) de parto importada(s)${atualizacoesNome.length ? `, ${atualizacoesNome.length} nome(s) de animal atualizado(s)` : ''}${naoEncontrados.length ? `, ${naoEncontrados.length} animal(is) não encontrado(s)` : ''}${semData.length ? `, ${semData.length} sem data válida` : ''}`, naoEncontrados.length || semData.length ? 'error' : 'success');
       closeModal();
-      pageReproducao();
+      if (registros.length) pageReproducao();
 
-      if (naoEncontrados.length) {
-        showModal('Animais não encontrados', `
-          <p class="text-sm text-gray-600 mb-3">Esses ${naoEncontrados.length} animal(is) da planilha não bateram com nenhuma fêmea ativa cadastrada no Rebanho (nem pelo brinco, nem pelo nome). Confira se não há erro de digitação ou se o animal ainda não foi cadastrado.</p>
-          <div class="max-h-64 overflow-y-auto border rounded-md p-2 text-sm font-mono">${naoEncontrados.map(id => escapeHtml(id)).join('<br>')}</div>
+      if (naoEncontrados.length || semData.length) {
+        showModal('Detalhes da importação', `
+          ${naoEncontrados.length ? `
+            <p class="text-sm text-gray-600 mb-2"><strong>${naoEncontrados.length} animal(is)</strong> da planilha não bateram com nenhuma fêmea ativa cadastrada no Rebanho (nem pelo brinco, nem pelo nome). Confira se não há erro de digitação, se o brinco no sistema está escrito exatamente igual (ex.: espaços, maiúsculas), ou se o animal ainda não foi cadastrado.</p>
+            <div class="max-h-48 overflow-y-auto border rounded-md p-2 text-sm font-mono mb-3">${naoEncontrados.map(id => escapeHtml(id)).join('<br>')}</div>
+          ` : ''}
+          ${semData.length ? `
+            <p class="text-sm text-gray-600 mb-2"><strong>${semData.length} linha(s)</strong> tinham data de I.A. ou previsão de parto que não consegui interpretar. Confira se o mapeamento das colunas de data está certo, e se as datas estão em formato dd/mm/aaaa.</p>
+            <div class="max-h-48 overflow-y-auto border rounded-md p-2 text-sm font-mono mb-3">${semData.map(id => escapeHtml(id)).join('<br>')}</div>
+          ` : ''}
           <div class="flex justify-end mt-3"><button type="button" id="btnFecharNaoEncontrados" class="px-4 py-2 text-sm rounded-md border">Fechar</button></div>
         `);
-        document.getElementById('btnFecharNaoEncontrados').onclick = closeModal;
+        document.getElementById('btnFecharNaoEncontrados').onclick = () => { closeModal(); if (!registros.length) pageReproducao(); };
       }
     },
   });
