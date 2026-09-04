@@ -784,26 +784,33 @@ function importarPesagensCSV() {
 function corrigirSexoCategoriaCSV() {
   formImportarCSV({
     titulo: 'Corrigir sexo/categoria em lote',
-    instrucoes: 'Use isso se algum animal ficou cadastrado com o sexo ou a categoria errada (por exemplo, se uma importação anterior marcou o rebanho todo como macho por engano). Cada linha atualiza o animal já cadastrado com esse brinco — não cria animal novo. Se não souber a categoria de cada um, pode deixar essa coluna sem mapear e corrigir só o sexo.',
+    instrucoes: 'Use isso se algum animal ficou cadastrado com o sexo ou a categoria errada (por exemplo, se uma importação anterior marcou o rebanho todo como macho por engano). Cada linha atualiza o animal já cadastrado com esse brinco — não cria animal novo. Se o brinco não bater (ex.: sua planilha tem o RGN/RGD, mas o sistema tem o número do chip), eu tento casar pelo nome cadastrado do animal como alternativa — nesse caso, mapeie a coluna do RGN/RGD também no campo "Nome". Se não souber a categoria de cada um, pode deixar essa coluna sem mapear e corrigir só o sexo.',
     campos: [
       { key: 'identificacao', label: 'Brinco / RGN do animal', obrigatorio: true },
+      { key: 'nome', label: 'Nome cadastrado do animal (usado se o brinco não bater)' },
       { key: 'sexo', label: 'Sexo correto (F ou M)', permiteFixo: true },
       { key: 'categoria', label: 'Categoria correta (Vaca, Novilha, Touro, Boi...)', permiteFixo: true },
     ],
     onImportar: async (rows, mapping, fixos) => {
       const get = (r, k) => (mapping[k] !== undefined ? (r[mapping[k]] || '').trim() : (fixos[k] || ''));
-      const todosAnimais = await dbSelect('animais', { select: 'id,identificacao,sexo,categoria' });
+      const todosAnimais = await dbSelect('animais', { select: 'id,identificacao,nome,sexo,categoria' });
       const porIdentificacao = {};
-      todosAnimais.forEach(a => { porIdentificacao[(a.identificacao || '').trim().toLowerCase()] = a; });
+      const porNome = {};
+      todosAnimais.forEach(a => {
+        if (a.identificacao) porIdentificacao[a.identificacao.trim().toLowerCase()] = a;
+        if (a.nome) porNome[a.nome.trim().toLowerCase()] = a;
+      });
 
       const atualizacoes = [];
       const naoEncontrados = [];
       const semAlteracao = [];
       rows.forEach(r => {
         const identificacao = get(r, 'identificacao');
-        if (!identificacao) return;
-        const animal = porIdentificacao[identificacao.toLowerCase()];
-        if (!animal) { naoEncontrados.push(identificacao); return; }
+        const nomeBusca = get(r, 'nome');
+        if (!identificacao && !nomeBusca) return;
+        let animal = identificacao ? porIdentificacao[identificacao.toLowerCase()] : null;
+        if (!animal && nomeBusca) animal = porNome[nomeBusca.toLowerCase()];
+        if (!animal) { naoEncontrados.push(identificacao || nomeBusca); return; }
         const sexoTxt = get(r, 'sexo').toUpperCase();
         const sexo = sexoTxt === 'F' || sexoTxt === 'FEMEA' || sexoTxt === 'FÊMEA' ? 'F'
           : sexoTxt === 'M' || sexoTxt === 'MACHO' ? 'M' : null;
@@ -813,7 +820,7 @@ function corrigirSexoCategoriaCSV() {
         if (sexo && sexo !== animal.sexo) { upd.sexo = sexo; mudou = true; }
         if (categoria && categoria !== animal.categoria) { upd.categoria = categoria; mudou = true; }
         if (mudou) atualizacoes.push(upd);
-        else semAlteracao.push(identificacao);
+        else semAlteracao.push(identificacao || nomeBusca);
       });
 
       if (atualizacoes.length) await dbUpsert('animais', atualizacoes, 'id');
@@ -824,7 +831,7 @@ function corrigirSexoCategoriaCSV() {
 
       if (naoEncontrados.length) {
         showModal('Animais não encontrados', `
-          <p class="text-sm text-gray-600 mb-3">Esses ${naoEncontrados.length} brinco(s) não bateram com nenhum animal cadastrado (de nenhum status).</p>
+          <p class="text-sm text-gray-600 mb-3">Esses ${naoEncontrados.length} brinco(s)/nome(s) não bateram com nenhum animal cadastrado (de nenhum status).</p>
           <div class="max-h-64 overflow-y-auto border rounded-md p-2 text-sm font-mono">${naoEncontrados.map(id => escapeHtml(id)).join('<br>')}</div>
           <div class="flex justify-end mt-3"><button type="button" id="btnFecharNaoEncontrados" class="px-4 py-2 text-sm rounded-md border">Fechar</button></div>
         `);
