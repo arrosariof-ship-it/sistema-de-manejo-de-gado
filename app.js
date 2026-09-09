@@ -1984,6 +1984,14 @@ function formEventoReprodutivo() {
     const obj = formToObject(form);
     const cadastrarBezerro = obj.cadastrar_bezerro === '1';
     delete obj.cadastrar_bezerro;
+    // Limpa campos que ficaram escondidos (de uma troca anterior do "Tipo de
+    // evento") pra não gravar lixo de outro tipo de evento — ex.: trocar de
+    // "Parto" pra "Diagnóstico" pra "Aborto" sem isso deixava a dificuldade
+    // de parto e a previsão de parto antigas coladas no registro final.
+    const tipo = obj.tipo_evento;
+    if (tipo !== 'diagnostico_gestacao') obj.resultado = null;
+    if (!(tipo === 'inseminacao' || tipo === 'monta_natural')) { obj.touro_semen = null; obj.data_prevista_parto = null; }
+    if (tipo !== 'parto') { obj.peso_bezerro = null; obj.sexo_bezerro = null; obj.dificuldade_parto = null; }
     if (obj.peso_bezerro) obj.peso_bezerro = Number(obj.peso_bezerro);
     try {
       const evento = await dbInsert('eventos_reprodutivos', obj);
