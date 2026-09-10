@@ -2729,10 +2729,18 @@ async function renderCustosLancamentos() {
       ${CATEGORIAS_CUSTO.filter(c => porCategoria[c.value]).slice(0, 3).map(c => statCard('▫️', fmtMoney(porCategoria[c.value]), c.label)).join('')}
     </div>
 
+    <div id="barraClassificarCusto" class="hidden bg-brand-50 border border-brand-200 rounded-lg p-3 mb-3 flex flex-wrap items-center gap-2">
+      <span class="text-sm text-brand-800"><strong id="qtdSelecionadosCusto">0</strong> selecionado(s)</span>
+      <select id="selCategoriaLote" class="border rounded-md px-2 py-1.5 text-sm bg-white">${sel('_', [{ value: '', label: '— escolha a categoria —' }, ...CATEGORIAS_CUSTO], '').replace(/<\/?select[^>]*>/g, '')}</select>
+      <button id="btnAplicarCategoriaLote" class="bg-brand-600 hover:bg-brand-700 text-white text-sm px-3 py-1.5 rounded-md">Classificar selecionados</button>
+      <button id="btnLimparSelecaoCusto" class="text-sm text-gray-500 hover:text-gray-700 px-2">Limpar seleção</button>
+    </div>
+
     <div class="bg-white border rounded-lg overflow-x-auto">
       <table class="w-full text-sm">
-        <thead><tr class="text-left text-gray-500 border-b"><th class="py-2 px-3">Data</th><th>Categoria</th><th>Descrição</th><th>Lote/Pasto</th><th class="text-right">Valor</th><th></th><th></th></tr></thead>
+        <thead><tr class="text-left text-gray-500 border-b"><th class="py-2 px-3 w-8"><input type="checkbox" id="chkTodosCusto"></th><th>Data</th><th>Categoria</th><th>Descrição</th><th>Lote/Pasto</th><th class="text-right">Valor</th><th></th><th></th></tr></thead>
         <tbody>${custos.map(c => `<tr class="border-b last:border-0">
+          <td class="py-2 px-3"><input type="checkbox" class="chkCusto" value="${c.id}"></td>
           <td class="py-2 px-3">${fmtDate(c.data)}</td>
           <td>${CATEGORIAS_CUSTO.find(x => x.value === c.categoria)?.label || c.categoria}</td>
           <td>${escapeHtml(c.descricao)}${c.nf_numero ? ` <span class="text-xs text-gray-400">(NF ${escapeHtml(c.nf_numero)})</span>` : ''}</td>
@@ -2740,7 +2748,7 @@ async function renderCustosLancamentos() {
           <td class="text-right">${fmtMoney(c.valor)}</td>
           <td class="text-center px-1">${c.anexo_path ? `<a href="${anexoUrl(c.anexo_path)}" target="_blank" rel="noopener" title="Ver anexo">📎</a>` : ''}</td>
           <td class="text-right px-3"><button data-id="${c.id}" class="btnExcluirCusto text-gray-400 hover:text-red-600">🗑️</button></td>
-        </tr>`).join('') || `<tr><td colspan="7" class="text-center text-gray-400 py-6">Nenhum custo lançado no período</td></tr>`}</tbody>
+        </tr>`).join('') || `<tr><td colspan="8" class="text-center text-gray-400 py-6">Nenhum custo lançado no período</td></tr>`}</tbody>
       </table>
     </div>
   `;
@@ -2762,6 +2770,37 @@ async function renderCustosLancamentos() {
       pageCustos();
     };
   });
+
+  // Seleção em lote pra classificar vários custos de uma vez (ex.: todos os
+  // lançamentos de um mesmo fornecedor que vieram sem categoria da planilha).
+  const barraClassificar = document.getElementById('barraClassificarCusto');
+  const qtdSpan = document.getElementById('qtdSelecionadosCusto');
+  const chkTodos = document.getElementById('chkTodosCusto');
+  function checkboxesLinhas() { return Array.from(document.querySelectorAll('.chkCusto')); }
+  function atualizarBarraSelecao() {
+    const marcados = checkboxesLinhas().filter(c => c.checked);
+    qtdSpan.textContent = marcados.length;
+    barraClassificar.classList.toggle('hidden', marcados.length === 0);
+  }
+  chkTodos.onchange = () => {
+    checkboxesLinhas().forEach(c => { c.checked = chkTodos.checked; });
+    atualizarBarraSelecao();
+  };
+  checkboxesLinhas().forEach(c => { c.addEventListener('change', atualizarBarraSelecao); });
+  document.getElementById('btnLimparSelecaoCusto').onclick = () => {
+    checkboxesLinhas().forEach(c => { c.checked = false; });
+    chkTodos.checked = false;
+    atualizarBarraSelecao();
+  };
+  document.getElementById('btnAplicarCategoriaLote').onclick = async () => {
+    const ids = checkboxesLinhas().filter(c => c.checked).map(c => c.value);
+    const novaCategoria = document.getElementById('selCategoriaLote').value;
+    if (!ids.length) return;
+    if (!novaCategoria) { toast('Escolha uma categoria', 'error'); return; }
+    await dbUpdateEmLote('custos', ids.map(id => ({ id, categoria: novaCategoria })));
+    toast(`${ids.length} lançamento(s) classificado(s) como "${CATEGORIAS_CUSTO.find(x => x.value === novaCategoria)?.label || novaCategoria}"`, 'success');
+    pageCustos();
+  };
 }
 
 function formCusto() {
